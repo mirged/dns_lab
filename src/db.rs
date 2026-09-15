@@ -217,41 +217,45 @@ impl Db {
         Ok(())
     }
 
-    /// Atomically take up to `limit` undelivered blobs for `to_id`.
-    pub fn mailbox_take(&self, to_id: &str, limit: i64) -> Vec<(String, String)> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = match conn.transaction() {
-            Ok(t) => t,
+    /// Look at up to `limit` undelivered blobs for `to_id` without consuming them.
+    ///
+    /// Delivery must be confirmed separately with [`Db::mailbox_mark_delivered`]
+    /// so that a reply which never reaches the client (e.g. truncated over UDP)
+    /// does not silently drop the queued messages.
+    pub fn mailbox_peek(&self, to_id: &str, limit: i64) -> Vec<(i64, String, String)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, msg_id, blob FROM mailbox
+             WHERE to_id = ?1 AND delivered = 0 ORDER BY id ASC LIMIT ?2",
+        ) {
+            Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let taken = {
-            let mut stmt = match tx.prepare(
-                "SELECT id, msg_id, blob FROM mailbox
-                 WHERE to_id = ?1 AND delivered = 0 ORDER BY id ASC LIMIT ?2",
-            ) {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            let rows = stmt.query_map(params![to_id, limit], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            });
-            match rows {
-                Ok(iter) => iter.filter_map(|r| r.ok()).collect::<Vec<_>>(),
-                Err(_) => Vec::new(),
-            }
-        };
-        for (id, _, _) in &taken {
-            let _ = tx.execute(
+        let rows = stmt.query_map(params![to_id, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Mark specific mailbox rows as delivered (after a reply is actually sent).
+    pub fn mailbox_mark_delivered(&self, ids: &[i64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let conn = self.conn.lock().unwrap();
+        for id in ids {
+            let _ = conn.execute(
                 "UPDATE mailbox SET delivered = 1 WHERE id = ?1",
                 params![id],
             );
         }
-        let _ = tx.commit();
-        taken.into_iter().map(|(_, m, b)| (m, b)).collect()
     }
 
     // ---- peers ----------------------------------------------------------

@@ -64,6 +64,13 @@ fn serve_tcp_conn(node: Arc<Node>, mut stream: TcpStream) {
         return;
     }
     if let Some(resp) = handle_datagram(&node, &buf, true) {
+        if resp.len() > u16::MAX as usize {
+            node.log(format!(
+                "[!] dropping oversized TCP reply ({} bytes)",
+                resp.len()
+            ));
+            return;
+        }
         let len = (resp.len() as u16).to_be_bytes();
         let _ = stream.write_all(&len);
         let _ = stream.write_all(&resp);
@@ -90,7 +97,7 @@ fn handle_datagram(node: &Node, bytes: &[u8], tcp: bool) -> Option<Vec<u8>> {
         Some(p) => p,
         None => {
             return if node.cfg.authoritative {
-                Some(build_reply(node, &request, &[], RCODE::NameError, tcp))
+                Some(build_reply(node, &request, &[], RCODE::NameError, tcp).0)
             } else {
                 None
             };
@@ -107,19 +114,44 @@ fn handle_datagram(node: &Node, bytes: &[u8], tcp: bool) -> Option<Vec<u8>> {
                 qname.len()
             ));
             handle_chunk(node, &parsed);
-            Some(build_reply(
+            let (resp, _) = build_reply(
                 node,
                 &request,
                 &[format!("a:{}:{}", parsed.msg_id, parsed.seq)],
                 RCODE::NoError,
                 tcp,
-            ))
+            );
+            Some(resp)
         }
         verb::POLL => {
-            let txt = handle_poll(node, &parsed);
-            Some(build_reply(node, &request, &txt, RCODE::NoError, tcp))
+            let (txt, ids) = handle_poll(node, &parsed);
+            let (resp, truncated) = build_reply(node, &request, &txt, RCODE::NoError, tcp);
+            // Only consume the mailbox once the reply actually goes out. A reply
+            // truncated over UDP is retried over TCP, which re-reads the same
+            // still-undelivered entries instead of losing them.
+            if !ids.is_empty() {
+                if truncated {
+                    node.log(format!(
+                        "[<] poll from {}: reply truncated, will retry over TCP",
+                        parsed.msg_id
+                    ));
+                } else {
+                    node.log(format!(
+                        "[<] poll from {}: {} message(s) delivered",
+                        parsed.msg_id,
+                        ids.len()
+                    ));
+                }
+            }
+            if !truncated {
+                node.db.mailbox_mark_delivered(&ids);
+            }
+            Some(resp)
         }
-        _ => Some(build_reply(node, &request, &[], RCODE::NoError, tcp)),
+        _ => {
+            let (resp, _) = build_reply(node, &request, &[], RCODE::NoError, tcp);
+            Some(resp)
+        }
     }
 }
 
@@ -185,25 +217,43 @@ fn handle_chunk(node: &Node, parsed: &protocol::TunnelQuery) {
     node.db.delete_chunks(&parsed.msg_id);
 }
 
-fn handle_poll(node: &Node, parsed: &protocol::TunnelQuery) -> Vec<String> {
+/// Upper bound on the TXT payload of one poll reply. Keeps the message below the
+/// 65535-byte DNS/TCP limit even before name compression and record overhead.
+const MAX_POLL_TXT_BYTES: usize = 55_000;
+
+/// Build mailbox TXT entries, returning them with the row ids they came from.
+///
+/// Messages are added whole; once one no longer fits in the reply budget it and
+/// everything after it are left for a later poll so no blob is split across
+/// replies.
+fn handle_poll(node: &Node, parsed: &protocol::TunnelQuery) -> (Vec<String>, Vec<i64>) {
     let requester = parsed.msg_id.clone();
-    let blobs = node.db.mailbox_take(&requester, 8);
-    let mut txt = vec![format!("cursor:{}", blobs.len())];
     let max = protocol::max_data_chars(&node.cfg.zone).min(200);
-    for (mid, blob) in blobs {
+    let rows = node.db.mailbox_peek(&requester, 8);
+
+    let mut txt = Vec::new();
+    let mut ids = Vec::new();
+    let mut budget = MAX_POLL_TXT_BYTES;
+    for (id, mid, blob) in rows {
         let segs = protocol::split_into_queries(&blob, max);
         let total = segs.len();
-        for (i, seg) in segs.iter().enumerate() {
-            txt.push(format!("m:{mid}:{i}:{total}:{seg}"));
+        let entries: Vec<String> = segs
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| format!("m:{mid}:{i}:{total}:{seg}"))
+            .collect();
+        // +1 per entry for its TXT character-string length prefix.
+        let cost: usize = entries.iter().map(|e| e.len() + 1).sum();
+        if cost > budget {
+            break;
         }
+        budget -= cost;
+        txt.extend(entries);
+        ids.push(id);
     }
-    if txt.len() > 1 {
-        node.log(format!(
-            "[<] poll from {requester}: {} message(s) delivered",
-            txt.len() - 1
-        ));
-    }
-    txt
+
+    txt.insert(0, format!("cursor:{}", ids.len()));
+    (txt, ids)
 }
 
 fn apply_opt(node: &Node, request: &Packet, reply: &mut Packet) {
@@ -224,7 +274,15 @@ fn udp_limit(request: &Packet) -> usize {
         .max(512)
 }
 
-fn build_reply(node: &Node, request: &Packet, txt: &[String], rcode: RCODE, tcp: bool) -> Vec<u8> {
+/// Build a reply. The bool is `true` when the reply was truncated to fit the
+/// client's UDP payload size (so the caller knows the payload was not delivered).
+fn build_reply(
+    node: &Node,
+    request: &Packet,
+    txt: &[String],
+    rcode: RCODE,
+    tcp: bool,
+) -> (Vec<u8>, bool) {
     let mut reply = Packet::new_reply(request.id());
     reply.set_flags(PacketFlag::AUTHORITATIVE_ANSWER);
     if request.has_flags(PacketFlag::RECURSION_DESIRED) {
@@ -260,9 +318,9 @@ fn build_reply(node: &Node, request: &Packet, txt: &[String], rcode: RCODE, tcp:
             t.questions.push(q.clone());
         }
         apply_opt(node, request, &mut t);
-        return t.build_bytes_vec_compressed().unwrap_or_default();
+        return (t.build_bytes_vec_compressed().unwrap_or_default(), true);
     }
-    bytes
+    (bytes, false)
 }
 
 fn build_soa_reply(node: &Node, request: &Packet, tcp: bool) -> Vec<u8> {

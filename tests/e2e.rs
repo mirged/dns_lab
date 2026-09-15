@@ -68,6 +68,78 @@ fn two_nodes_exchange_multichunk_message() {
     node_b.stop();
 }
 
+/// Low-compressibility text so the message really spans many chunks and forces
+/// the poll reply past the UDP payload limit (regression for dropped packets).
+fn noisy_text(n: usize) -> String {
+    let mut s = String::with_capacity(n);
+    let mut x: u64 = 0x1234_5678_9abc_def0;
+    while s.len() < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.push((b'a' + (x % 26) as u8) as char);
+    }
+    s
+}
+
+#[test]
+fn relay_mailbox_long_message() {
+    let relay_addr = "127.0.0.1:11559";
+
+    let db_relay = Arc::new(Db::open_in_memory().unwrap());
+    let db_b = Arc::new(Db::open_in_memory().unwrap());
+    let db_a = Arc::new(Db::open_in_memory().unwrap());
+
+    let relay_cfg = Config {
+        node_id: "rrrr9999".to_string(),
+        listen_addr: relay_addr.to_string(),
+        zone: "lab.local".to_string(),
+        authoritative: true,
+        ..Config::default()
+    };
+    let relay = Node::new(relay_cfg, db_relay.clone(), std::sync::mpsc::channel().0);
+    relay.start();
+
+    let mut b_cfg = node_cfg("bbbb2222", "127.0.0.1:11560", relay_addr);
+    b_cfg.relay = Some(relay_addr.to_string());
+    b_cfg.poll_interval_secs = 1;
+    let node_b = Node::new(b_cfg, db_b.clone(), std::sync::mpsc::channel().0);
+    node_b.start();
+
+    let node_a = Node::new(
+        node_cfg("aaaa1111", "127.0.0.1:11561", relay_addr),
+        db_a.clone(),
+        std::sync::mpsc::channel().0,
+    );
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // ~12 KB of noisy text: the poll reply is far too big for one UDP datagram,
+    // so the client must fall back to TCP without the relay dropping the message.
+    let body = noisy_text(12_000);
+    let msg_id = dns_lab::random_id();
+    node_a
+        .do_send("bbbb2222", &body, &msg_id)
+        .expect("send via relay");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let msgs = db_b.messages_for("aaaa1111", 10);
+        if let Some(m) = msgs.iter().find(|m| m.msg_id == msg_id) {
+            assert_eq!(m.body, body, "reassembled long body mismatch");
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("long relayed message never reached B's inbox");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    relay.stop();
+    node_a.stop();
+    node_b.stop();
+}
+
 #[test]
 fn relay_mailbox_delivery() {
     let relay_addr = "127.0.0.1:11556";

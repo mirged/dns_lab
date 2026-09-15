@@ -364,7 +364,7 @@ the encrypted envelope.
 ## Testing
 
 ```sh
-cargo test --all-targets                                   # 6 unit + 2 e2e
+cargo test --all-targets                                   # 6 unit + 3 e2e
 cargo test --no-default-features --all-targets             # headless build
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
@@ -381,9 +381,11 @@ Known issues (contributions welcome):
   avoid the status/navigation bars, but falls back to a 24 dp top inset if the
   platform reports nothing. Behaviour varies by device.
 - **Packet loss**: UDP retries and TCP fallback exist, but there is no
-  end-to-end delivery guarantee. The relay marks mailbox entries delivered when
-  they are *fetched*, so a lost poll response or a crash mid-decrypt loses the
-  message. Chunks older than 5 minutes are garbage-collected.
+  end-to-end delivery guarantee. The relay marks mailbox entries delivered only
+  once a poll reply is actually sent, so a reply truncated over UDP is retried
+  over TCP without dropping the queued messages; a lost (non-truncated) UDP
+  reply or a crash mid-decrypt can still lose the message. Chunks older than 5
+  minutes are garbage-collected.
 - **Large messages**: chunk count grows quickly; there is no throughput control
   or congestion awareness.
 - **Security**: no audit, no key exchange/rotation, no replay protection, shared
