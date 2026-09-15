@@ -1,0 +1,30 @@
+# dns_lab authoritative relay configuration (headless VPS).
+#
+# On the VPS this is installed as /etc/dns_lab/dns_lab.toml by
+# `deploy/headless/install.sh`. The relay must bind port 53 and be reachable
+# from the public internet via an NS delegation for `zone`.
+
+display_name = "relay"
+
+# Bind UDP + TCP on port 53. Requires root or CAP_NET_BIND_SERVICE (granted by
+# the shipped systemd unit).
+listen_addr = "0.0.0.0:53"
+
+# Zone this relay is authoritative for. Point an NS record here.
+zone = "t.example.com"
+
+# Answer SOA for the apex and NXDOMAIN outside the zone.
+authoritative = true
+
+# The relay stores and forwards; it does not originate queries itself.
+egress = "direct"
+
+# Pre-shared secret. MUST be identical on every client and relay.
+# Generate one with: openssl rand -base64 32
+shared_key = "CHANGE-ME-to-a-long-random-secret"
+
+# Persistent SQLite mailbox / message store.
+db_path = "/var/lib/dns_lab/dns_lab.db"
+
+# Seconds between internal housekeeping passes.
+poll_interval_secs = 2

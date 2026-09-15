@@ -1,0 +1,29 @@
+# DNS Lab authoritative relay configuration (headless).
+#
+# Edit with:  sudo dns-lab-config
+# Apply with: sudo systemctl restart dns_lab
+
+display_name = "relay"
+
+# UDP + TCP bind address. Port 53 needs CAP_NET_BIND_SERVICE (granted by the
+# systemd unit) or root.
+listen_addr = "0.0.0.0:53"
+
+# Delegated zone the relay is authoritative for (NS record points here).
+zone = "t.example.com"
+
+# Answer SOA/NS for the apex and NXDOMAIN outside the zone.
+authoritative = true
+
+# Relay talks to itself; keep direct. Drop a recursive resolver in `resolver`
+# only if you also want the relay to originate outbound queries.
+egress = "direct"
+
+# Shared secret. MUST be identical on every node. Generate one with:
+#   dns-lab-config --gen-key
+shared_key = "CHANGE-ME-an-ultra-secure-secret-key!!"
+
+db_path = "/var/lib/dns_lab/dns_lab.db"
+
+# Seconds between mailbox polls.
+poll_interval_secs = 2

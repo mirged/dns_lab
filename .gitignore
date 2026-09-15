@@ -1,0 +1,43 @@
+# ---- Rust / Cargo build output ----
+/target
+/dist
+**/*.rs.bk
+*.pdb
+
+# ---- Local runtime state (never commit a live node's database or config) ----
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+dns_lab.toml
+config.local.toml
+*.local.toml
+*.log
+
+# ---- Secrets / credentials ----
+*.jks
+*.keystore
+keystores/
+*.pem
+*.key
+.env
+.env.*
+secrets.toml
+
+# ---- Android build / local SDK & NDK paths ----
+local.properties
+/android/local.properties
+/android/.gradle/
+/android/app/build/
+*.apk
+*.aab
+
+# ---- Editor / OS cruft ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*~

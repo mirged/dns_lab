@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Convenience editor for the DNS Lab relay configuration.
+#
+#   sudo dns-lab-config                    interactive menu
+#   dns-lab-config --show                  print the whole config
+#   dns-lab-config --get zone              print a single value
+#   dns-lab-config --gen-key               print a fresh random shared key
+#   sudo dns-lab-config --set zone t.example.com --set shared_key ABC123
+#   sudo dns-lab-config --set listen_addr 0.0.0.0:53 --no-restart
+#
+# Known numeric/boolean keys are written unquoted; other keys as TOML strings.
+# All other lines in the file are preserved.
+set -euo pipefail
+
+CONFIG="${DNS_LAB_CONFIG:-/etc/dns_lab/dns_lab.toml}"
+SERVICE="${DNS_LAB_SERVICE:-dns_lab}"
+
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; }
+
+# cfg_get <key> <fallback>
+cfg_get() {
+    local key="$1" fallback="${2-}" val
+    [ -f "$CONFIG" ] || { printf '%s' "$fallback"; return; }
+    val="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG" | tail -n1 || true)"
+    [ -n "$val" ] || { printf '%s' "$fallback"; return; }
+    val="${val#*=}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    case "$val" in
+        \"*\")
+            val="${val:1:${#val}-2}"
+            local ph=$'\x01'
+            val="${val//\\\\/$ph}"
+            val="${val//\\\"/\"}"
+            val="${val//$ph/\\}"
+            ;;
+    esac
+    printf '%s' "$val"
+}
+
+# toml_literal <key> <value> -- numbers/bools unquoted, everything else quoted
+toml_literal() {
+    local key="$1" value="$2"
+    case "$key" in
+        authoritative) printf '%s' "$value" ;;
+        poll_interval_secs|edns_udp_size|timeout_ms|retries|ui_scale) printf '%s' "$value" ;;
+        *)
+            local esc="${value//\\/\\\\}"; esc="${esc//\"/\\\"}"
+            printf '"%s"' "$esc"
+            ;;
+    esac
+}
+
+# cfg_set <key> <value>
+cfg_set() {
+    local key="$1" value="$2"
+    local dir; dir="$(dirname "$CONFIG")"
+    [ -d "$dir" ] || mkdir -p "$dir"
+
+    local newline="${key} = $(toml_literal "$key" "$value")"
+    local tmp; tmp="$(mktemp)"
+    local found=0 line trimmed rest
+    : > "$tmp"
+    if [ -f "$CONFIG" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            if [ "$found" -eq 0 ] && [ "${trimmed:0:${#key}}" = "$key" ]; then
+                rest="${trimmed#"$key"}"
+                rest="${rest#"${rest%%[![:space:]]*}"}"
+                if [ "${rest:0:1}" = "=" ]; then
+                    printf '%s\n' "$newline" >> "$tmp"
+                    found=1
+                    continue
+                fi
+            fi
+            printf '%s\n' "$line" >> "$tmp"
+        done < "$CONFIG"
+    fi
+    [ "$found" -eq 1 ] || printf '%s\n' "$newline" >> "$tmp"
+    cat "$tmp" > "$CONFIG"
+    rm -f "$tmp"
+}
+
+gen_key() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 32 | tr -d '\n'
+    else
+        head -c 32 /dev/urandom | base64 | tr -d '\n'
+    fi
+}
+
+mask_key() {
+    local k="$1"
+    if [ "${#k}" -le 8 ]; then printf '********'; return; fi
+    printf '%s…%s (%d chars)' "${k:0:4}" "${k: -4}" "${#k}"
+}
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "error: this operation needs root (try: sudo $0)" >&2
+        exit 1
+    fi
+}
+
+restart_service() {
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl restart "$SERVICE" 2>/dev/null; then
+            echo "Restarted $SERVICE."
+        else
+            echo "warn: could not restart $SERVICE (journalctl -u $SERVICE)" >&2
+        fi
+    else
+        echo "note: systemd not found; restart the relay manually."
+    fi
+}
+
+prompt() {
+    local label="$1" current="$2" answer
+    read -r -p "$label [$current]: " answer
+    [ -n "$answer" ] && printf '%s' "$answer" || printf '%s' "$current"
+}
+
+menu() {
+    require_root
+    while true; do
+        printf '\n'
+        printf 'DNS Lab relay config: %s\n' "$CONFIG"
+        printf ' 1) Display name       : %s\n' "$(cfg_get display_name relay)"
+        printf ' 2) Listen address     : %s\n' "$(cfg_get listen_addr 0.0.0.0:53)"
+        printf ' 3) Zone               : %s\n' "$(cfg_get zone t.example.com)"
+        printf ' 4) Shared key         : %s\n' "$(mask_key "$(cfg_get shared_key '')")"
+        printf ' 5) Generate random key\n'
+        printf ' 6) Database path      : %s\n' "$(cfg_get db_path /var/lib/dns_lab/dns_lab.db)"
+        printf ' 7) Poll interval (s)  : %s\n' "$(cfg_get poll_interval_secs 2)"
+        printf ' 8) Show full config\n'
+        printf ' 9) Restart %s\n' "$SERVICE"
+        printf ' q) Quit\n'
+        read -r -p 'Select> ' choice
+        case "$choice" in
+            1) cfg_set display_name "$(prompt 'display_name' "$(cfg_get display_name relay)")" ;;
+            2) cfg_set listen_addr "$(prompt 'listen_addr (host:port)' "$(cfg_get listen_addr 0.0.0.0:53)")" ;;
+            3) cfg_set zone "$(prompt 'zone' "$(cfg_get zone t.example.com)")" ;;
+            4) read -r -s -p 'shared_key (empty keeps current): ' k; printf '\n'
+               if [ -n "$k" ]; then cfg_set shared_key "$k"; fi ;;
+            5) cfg_set shared_key "$(gen_key)"; printf 'Generated a new shared key.\n' ;;
+            6) cfg_set db_path "$(prompt 'db_path' "$(cfg_get db_path /var/lib/dns_lab/dns_lab.db)")" ;;
+            7) cfg_set poll_interval_secs "$(prompt 'poll_interval_secs' "$(cfg_get poll_interval_secs 2)")" ;;
+            8) printf '\n'; [ -f "$CONFIG" ] && cat "$CONFIG" || echo '(no config yet)' ;;
+            9) restart_service ;;
+            q|Q) break ;;
+            *) printf 'Unknown option.\n' ;;
+        esac
+    done
+}
+
+if [ $# -eq 0 ]; then
+    menu
+    exit 0
+fi
+
+restart=1
+did_set=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --show) cat "$CONFIG" ;;
+        --get) cfg_get "${2:?key required}" ""; printf '\n'; shift ;;
+        --gen-key) gen_key; printf '\n' ;;
+        --no-restart) restart=0 ;;
+        --set)
+            require_root
+            cfg_set "${2:?key required}" "${3:?value required}"
+            did_set=1
+            shift 2
+            ;;
+        -h|--help) usage ;;
+        *) echo "unknown argument: $1" >&2; usage; exit 1 ;;
+    esac
+    shift
+done
+
+if [ "$did_set" -eq 1 ]; then
+    echo "Updated $CONFIG"
+    if [ "$restart" -eq 1 ]; then restart_service; fi
+fi

@@ -1,0 +1,65 @@
+# dns_lab client configuration (desktop GUI or headless CLI).
+#
+# Copy to `dns_lab.toml` (same directory the binary runs from) and edit:
+#     cp config.example.toml dns_lab.toml
+#
+# Every field is optional; omitted keys fall back to the defaults shown.
+# The `node_id` is generated automatically on first load and written back by
+# the GUI. The `shared_key` MUST match every other node you talk to.
+
+display_name = "alice"
+
+# Leave empty to auto-generate a unique 8-hex node id on first run.
+node_id = ""
+
+# Local DNS listener. Clients do not need to bind port 53; any free port works.
+listen_addr = "127.0.0.1:1054"
+
+# Delegated zone you tunnel through. The VPS relay is authoritative for it.
+zone = "t.example.com"
+
+# Clients never answer authoritatively.
+authoritative = false
+
+# Egress mode:
+#   "resolver" -> send queries to a public recursive resolver (works anywhere)
+#   "direct"   -> send queries straight to a peer / relay ip:port (lab / LAN)
+egress = "resolver"
+
+# Recursive resolver used when egress = "resolver".
+resolver = "1.1.1.1:53"
+
+# Relay / authoritative server, used when egress = "direct" and no peer addr.
+# direct_server = "203.0.113.10:53"
+
+# Poll this relay for inbound mail (enables the mailbox mode). Also set when
+# using a relay with egress = "direct".
+# relay = "203.0.113.10:53"
+
+# Seconds between mailbox polls.
+poll_interval_secs = 2
+
+# EDNS0 advertised UDP payload size (fallback to TCP happens on truncation).
+edns_udp_size = 1232
+
+# Per-query timeout and retry count.
+timeout_ms = 800
+retries = 3
+
+# UI zoom multiplier for the desktop GUI (1.0 = platform default).
+ui_scale = 1.0
+
+# SQLite database. Relative paths resolve next to this config file.
+db_path = "alice.db"
+
+# Pre-shared secret. Use a long random value and keep it identical on all nodes.
+# Generate one with: openssl rand -base64 32
+shared_key = "CHANGE-ME-to-a-long-random-secret"
+
+# Known contacts. `via = "direct"` uses `addr`; `via = "relay"` routes through
+# the configured relay/direct_server. Names are cosmetic.
+[[peers]]
+id = "deadbeef"
+name = "bob"
+addr = ""
+via = "relay"

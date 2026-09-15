@@ -1,0 +1,79 @@
+[package]
+name = "dns_lab"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Experimental DNS-tunneling messenger: encrypted, compressed chat carried inside DNS queries (RFC 1035)."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["dns", "tunnel", "messenger", "encryption", "chaos"]
+categories = ["network-programming", "command-line-utilities"]
+# repository = "https://github.com/YOUR_GITHUB_USERNAME/dns_lab"
+# homepage = "https://github.com/YOUR_GITHUB_USERNAME/dns_lab"
+
+[features]
+# Desktop GUI is the default for local development and end users.
+default = ["gui"]
+# Optional egui/eframe front-end. Disable with `--no-default-features` to build
+# the tiny headless server/CLI binary (no graphics stack pulled in).
+gui = ["dep:eframe"]
+
+[dependencies]
+simple-dns = "0.12.0"
+data-encoding = "2.6"
+chacha20poly1305 = "0.11.0"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Desktop GUI (X11/Wayland). Optional so the headless build never pulls winit.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = { version = "0.36", optional = true, default-features = true }
+
+# Android GUI: glow/EGL, no accesskit (incompatible with native-activity).
+# Kept under cfg(target_os = "android") so desktop builds never see these.
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.36", optional = true, default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "android-native-activity",
+] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+
+[lib]
+name = "dns_lab"
+crate-type = ["rlib", "cdylib"]
+
+[package.metadata.android]
+package = "com.dnslab.messenger"
+apk_name = "dns-lab"
+build_targets = ["aarch64-linux-android"]
+min_sdk_version = 24
+target_sdk_version = 34
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+# NativeActivity launches our `android_main` in libdns_lab.so.
+[[package.metadata.android.application.activity]]
+name = "android.app.NativeActivity"
+exported = true
+window_soft_input_mode = "adjustResize"
+
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.app.lib_name"
+value = "dns_lab"
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
