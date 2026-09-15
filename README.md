@@ -1,11 +1,6 @@
 # dns_lab
 
-<!--
-  Replace OWNER below with your GitHub org/user once the repository exists.
-  The workflow badge only renders after the first CI run on the default branch.
--->
-
-[![CI](https://github.com/OWNER/dns_lab/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/dns_lab/actions/workflows/ci.yml)
+[![CI](https://github.com/mirged/dns_lab/actions/workflows/ci.yml/badge.svg)](https://github.com/mirged/dns_lab/actions/workflows/ci.yml)
 ![Edition](https://img.shields.io/badge/rust-2024%20edition-blue)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
 ![Stage](https://img.shields.io/badge/stage-early%20alpha-orange)
