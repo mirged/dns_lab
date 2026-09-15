@@ -422,10 +422,7 @@ wire-format or security impact explicitly (they will break things).
 
 ## License
 
-Licensed under the MIT license ([LICENSE-MIT](LICENSE-MIT)). Unless you
-explicitly state otherwise, any contribution intentionally submitted for
-inclusion in this project shall be licensed under the MIT license, with no
-additional terms.
+Licensed under the MIT license ([LICENSE-MIT](LICENSE-MIT)).
 
 ### Third-party notices
 
