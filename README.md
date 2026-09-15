@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/mirged/dns_lab/actions/workflows/ci.yml/badge.svg)](https://github.com/mirged/dns_lab/actions/workflows/ci.yml)
 ![Edition](https://img.shields.io/badge/rust-2024%20edition-blue)
-![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)
+![License](https://img.shields.io/badge/license-MIT-green)
 ![Stage](https://img.shields.io/badge/stage-early%20alpha-orange)
 ![Protocol](https://img.shields.io/badge/wire-RFC%201035%20DNS-blueviolet)
 
@@ -422,17 +422,14 @@ wire-format or security impact explicitly (they will break things).
 
 ## License
 
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option. Unless you explicitly state otherwise, any contribution
-intentionally submitted for inclusion in this project shall be dual-licensed as
-above, with no additional terms.
+Licensed under the MIT license ([LICENSE-MIT](LICENSE-MIT)). Unless you
+explicitly state otherwise, any contribution intentionally submitted for
+inclusion in this project shall be licensed under the MIT license, with no
+additional terms.
 
 ### Third-party notices
 
 - `src/smaz.rs` is a Rust port of [SMAZ](https://github.com/antirez/smaz) by
   Salvatore Sanfilippo, licensed under the 3-clause BSD license. See
-  [`LICENSES/SMAZ.txt`](LICENSES/SMAZ.txt).
+  [`LICENSES/SMAZ.txt`](LICENSES/SMAZ.txt). That notice must be retained when
+  redistributing this source or a build containing it.
