@@ -2,11 +2,11 @@
 # Install the DNS Lab headless relay from a release archive.
 #
 # Run as root from the unpacked archive:
-#   sudo ./install.sh --zone t.example.com --shared-key 'a-strong-secret'
+#   sudo ./install.sh --zone t.example.com
 #
 # Options:
 #   --zone ZONE          authoritative zone (default: keep example value)
-#   --shared-key KEY     shared secret for all nodes (default: generate one)
+#   --shared-key KEY     give the relay a key too (default: none, blind relay)
 #   --listen ADDR        UDP/TCP bind address (default: 0.0.0.0:53)
 #   --no-start           install but do not enable/start the service
 #   --force-config       overwrite an existing /etc/dns_lab/dns_lab.toml
@@ -85,11 +85,18 @@ else
     fi
     echo "==> Writing $CONFIG"
     install -m 0640 "$SRC_DIR/dns_lab.toml.example" "$CONFIG"
-    [ -n "$SHARED_KEY" ] || SHARED_KEY="$("$PREFIX/bin/dns-lab-config" --gen-key)"
-    "$PREFIX/bin/dns-lab-config" --no-restart \
-        --set zone "$ZONE" \
-        --set listen_addr "$LISTEN" \
-        --set shared_key "$SHARED_KEY"
+    # A relay needs no key: it forwards ciphertext and routes on the QNAME tag.
+    # Only set one when the operator asked for it explicitly.
+    if [ -n "$SHARED_KEY" ]; then
+        "$PREFIX/bin/dns-lab-config" --no-restart \
+            --set zone "$ZONE" \
+            --set listen_addr "$LISTEN" \
+            --set shared_key "$SHARED_KEY"
+    else
+        "$PREFIX/bin/dns-lab-config" --no-restart \
+            --set zone "$ZONE" \
+            --set listen_addr "$LISTEN"
+    fi
 fi
 chown -R root:"$SERVICE_USER" "$ETC_DIR"
 chmod 0640 "$CONFIG"
@@ -118,7 +125,7 @@ echo
 echo "=================================================="
 echo "  DNS Lab relay installed"
 echo "  Zone:        $ZONE"
-echo "  Shared key:  ${SHARED_KEY:-<unchanged>}"
+echo "  Shared key:  ${SHARED_KEY:-none (blind relay - forwards what it cannot read)}"
 echo "  Config:      $CONFIG"
 echo "  Database:    $VAR_DIR/dns_lab.db"
 echo "  Edit config: sudo dns-lab-config"

@@ -1,6 +1,6 @@
 [package]
 name = "dns_lab"
-version = "0.2.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Experimental DNS-tunneling messenger: encrypted, compressed chat carried inside DNS queries (RFC 1035)."
@@ -22,6 +22,15 @@ gui = ["dep:eframe"]
 simple-dns = "0.12.0"
 data-encoding = "2.6"
 chacha20poly1305 = "0.11.0"
+# Pure-Rust DEFLATE: compresses real chat text far better than SMAZ.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+# HKDF-SHA256 for real key derivation from the configured passphrase.
+hkdf = "0.12"
+sha2 = "0.10"
+# Per-node identities: Ed25519 signatures (authenticity) and X25519 agreement
+# (per-recipient payload keys once a peer is pinned).
+ed25519-dalek = { version = "3.0", default-features = false }
+curve25519-dalek = { version = "5.0", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

@@ -15,15 +15,34 @@ zone = "t.example.com"
 # Answer SOA/NS for the apex and NXDOMAIN outside the zone.
 authoritative = true
 
+# Forward mail for others, with quotas. `client` never forwards; `serve` always
+# promotes the relay to authoritative, so this only matters when the unit is
+# repurposed as a mailbox-only node.
+relay_mode = "authoritative"
+
+# Abuse limits: one host must not be able to fill the disk or the queue.
+rate_limit_per_sec = 40        # queries/s per source IP (0 = off)
+max_blobs_per_route = 200      # queued blobs per routing tag
+max_bytes_per_route = 5242880  # 5 MiB per routing tag
+
 # Relay talks to itself; keep direct. Drop a recursive resolver in `resolver`
 # only if you also want the relay to originate outbound queries.
 egress = "direct"
 
-# Shared secret. MUST be identical on every node. Generate one with:
-#   dns-lab-config --gen-key
-shared_key = "CHANGE-ME-an-ultra-secure-secret-key!!"
+# Shared secret.
+#
+# Leave this EMPTY on a relay: it then routes on opaque tags and can never
+# decrypt what it forwards ("blind relay"). Mail addressed to the relay itself
+# would not be readable without a key, which is the point.
+#
+# Set it only if this host also chats, and make it identical to the clients'.
+# Generate one with: dns-lab-config --gen-key
+shared_key = ""
 
 db_path = "/var/lib/dns_lab/dns_lab.db"
+
+# A relay does not receive files itself, but the client role does.
+download_dir = "/var/lib/dns_lab/downloads"
 
 # Seconds between mailbox polls.
 poll_interval_secs = 2

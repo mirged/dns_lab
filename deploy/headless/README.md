@@ -20,16 +20,17 @@ database files are needed on the target.
 ```sh
 tar xzf dns_lab-headless-*.tar.gz
 cd dns_lab-headless-*
-sudo ./install.sh --zone t.example.com --shared-key 'a-strong-shared-secret'
+sudo ./install.sh --zone t.example.com
 ```
 
-If you omit `--shared-key`, a random one is generated and printed. Use the
-**same** key on every client/relay node.
+No key is installed by default: the relay routes on opaque tags and forwards
+ciphertext it cannot read. Pass `--shared-key KEY` only if this host also sends
+or reads mail — then the key must be **identical** to the clients'.
 
 Flags:
 
 - `--zone ZONE` — delegated zone (default `t.example.com`)
-- `--shared-key KEY` — pre-shared secret
+- `--shared-key KEY` — give the relay a key too (default: none, blind relay)
 - `--listen ADDR` — bind address (default `0.0.0.0:53`)
 - `--no-start` — install without enabling/starting the service
 - `--force-config` — overwrite an existing config (backs it up first)

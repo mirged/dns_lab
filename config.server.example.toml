@@ -19,9 +19,22 @@ authoritative = true
 # The relay stores and forwards; it does not originate queries itself.
 egress = "direct"
 
-# Pre-shared secret. MUST be identical on every client and relay.
-# Generate one with: openssl rand -base64 32
-shared_key = "CHANGE-ME-to-a-long-random-secret"
+# "peer" forwards mail without claiming the zone; "authoritative" (implied by
+# `authoritative = true` and by `dns_lab serve`) also answers SOA / NXDOMAIN.
+# "client" never forwards, which is the safe default for a mailbox-only node.
+relay_mode = "authoritative"
+
+# Abuse limits. A relay that accepts mail for strangers is a shared resource.
+rate_limit_per_sec = 40        # queries/s per source IP (token bucket, 0 = off)
+max_blobs_per_route = 200      # queued blobs per routing tag
+max_bytes_per_route = 5242880  # 5 MiB per routing tag
+
+# Pre-shared secret.
+#
+# Leave EMPTY for a blind relay: it routes on opaque tags and cannot decrypt
+# anything. Set it only if this host also sends or reads mail, and make it
+# identical on every such node. Generate one with: openssl rand -base64 32
+shared_key = ""
 
 # Persistent SQLite mailbox / message store.
 db_path = "/var/lib/dns_lab/dns_lab.db"

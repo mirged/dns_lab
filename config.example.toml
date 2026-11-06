@@ -36,6 +36,11 @@ resolver = "1.1.1.1:53"
 # using a relay with egress = "direct".
 # relay = "203.0.113.10:53"
 
+# Fallback relays, tried in order after the primary. Sending moves on to the
+# next one when a relay does not accept the message; polling asks all of them,
+# so mail left on a secondary relay is still collected.
+# relays = ["203.0.113.11:53", "198.51.100.7:53"]
+
 # Seconds between mailbox polls.
 poll_interval_secs = 2
 
@@ -46,14 +51,34 @@ edns_udp_size = 1232
 timeout_ms = 800
 retries = 3
 
+# Chunk queries kept in flight at once. The cost of a message is
+# ceil(chunks / window) round trips instead of one per chunk, so this is the
+# main throughput knob; 1 restores the old serial behaviour.
+window = 8
+
+# This node only sends and polls; it never forwards mail for others.
+relay_mode = "client"
+
 # UI zoom multiplier for the desktop GUI (1.0 = platform default).
 ui_scale = 1.0
 
 # SQLite database. Relative paths resolve next to this config file.
 db_path = "alice.db"
 
-# Pre-shared secret. Use a long random value and keep it identical on all nodes.
-# Generate one with: openssl rand -base64 32
+# Where incoming files are written. Relative paths resolve next to this config
+# file. Files land as `<transfer-id>-<name>`; nothing is written until every
+# part has arrived and the SHA-256 checks out.
+download_dir = "downloads"
+
+# Per-recipient encryption switches on by itself once both sides have exchanged
+# public key bundles; nothing to configure. Each node also has an Ed25519 signing
+# key generated locally (see `dns_lab id` for its fingerprint).
+#
+# Shared secret (used as a passphrase, expanded with HKDF-SHA256 into a
+# 32-byte ChaCha20-Poly1305 key). Use a long random value and keep it identical
+# on every node that sends or reads mail. Leave empty and this node cannot
+# encrypt anything (only useful for a relay, which then forwards blindly).
+# Generate one with: openssl rand -base64 32   (or the GUI's "generate" button)
 shared_key = "CHANGE-ME-to-a-long-random-secret"
 
 # Known contacts. `via = "direct"` uses `addr`; `via = "relay"` routes through

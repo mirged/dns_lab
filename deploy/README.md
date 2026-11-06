@@ -43,7 +43,7 @@ Alternatively, build a portable archive with an installer on the build host:
 ```
 
 Copy the tarball to the VPS, unpack it, and run
-`sudo ./install.sh --zone t.example.com --shared-key '...'`. See
+`sudo ./install.sh --zone t.example.com`. See
 `deploy/headless/README.md` for details (`dns-lab-config` edits the config).
 
 ## 3. Relay config
@@ -55,7 +55,8 @@ display_name  = "relay"
 listen_addr   = "0.0.0.0:53"
 zone          = "t.example.com"
 authoritative = true
-shared_key    = "an-ultra-secure-secret-key-32a!!"
+# No key on the relay: it routes on tags and forwards ciphertext it cannot read.
+shared_key    = ""
 db_path       = "/var/lib/dns_lab/dns_lab.db"
 ```
 
@@ -94,7 +95,7 @@ zone             = "t.example.com"
 egress           = "resolver"
 resolver         = "1.1.1.1:53"
 poll_interval_secs = 2
-shared_key       = "an-ultra-secure-secret-key-32a!!"
+shared_key       = "CHANGE-ME-long-random-passphrase"
 db_path          = "alice.db"
 ```
 
@@ -127,5 +128,6 @@ dig @1.1.1.1 p.<your-node-id>.0.0.t.example.com TXT
   some networks block or poison DNS. Behaviour depends on the operator.
 - **Metadata:** the payload is encrypted, but query timing, sizes and counts are
   observable on the wire.
-- **Shared key:** the default key is lab-grade. Use a strong `shared_key` and keep
-  it identical on all nodes.
+- **Shared key:** clients still share one passphrase (there is no key exchange
+  yet). Use a long random one and keep it identical on every node that sends or
+  reads mail. Relays can run with `shared_key = ""` because they only route.

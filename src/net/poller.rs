@@ -1,84 +1,104 @@
-//! Mailbox poller: fetches queued inbound messages from a relay via DNS.
+//! Mailbox poller: fetches queued inbound blobs from every configured relay.
+//!
+//! Polling is non-destructive: the relay offers blobs, and the client
+//! acknowledges (`a.<tag>.<ids>`) the ones it managed to open, so a lost reply
+//! costs a retry instead of the message. A node with a `relays` fallback chain
+//! asks each of them, so mail parked on a secondary relay is not missed.
 
 use super::Node;
 use super::sender;
+use crate::net::Egress;
 use crate::protocol::{self, verb};
-use simple_dns::Packet;
-use simple_dns::rdata::RData;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Longest the poll interval may be stretched to after repeated failures.
+const MAX_BACKOFF_SECS: u64 = 60;
+/// How many message ids to acknowledge in one query. `build_ack_qname` trims
+/// the list further when the zone is long.
+const ACK_BATCH: usize = 8;
+
 pub fn spawn(node: Arc<Node>) {
     std::thread::spawn(move || {
+        let mut failures: u64 = 0;
         loop {
             if node.stopped() {
                 return;
             }
-            std::thread::sleep(Duration::from_secs(node.cfg.poll_interval_secs.max(1)));
-            if let Err(e) = poll_once(&node) {
-                node.log(format!("[!] poll failed: {e}"));
+            let base = node.cfg.poll_interval_secs.max(1);
+            // Exponential backoff (capped) so a dead relay is not hammered.
+            let wait = if failures == 0 {
+                base
+            } else {
+                (base * (1u64 << failures.min(4))).min(MAX_BACKOFF_SECS)
+            };
+            std::thread::sleep(Duration::from_secs(wait));
+            match poll_once(&node) {
+                Ok(()) => failures = 0,
+                Err(e) => {
+                    failures = failures.saturating_add(1);
+                    node.log(format!("[!] poll failed ({failures}x): {e}"));
+                }
             }
-            node.db.gc_chunks(300);
         }
     });
 }
 
-fn poll_once(node: &Node) -> Result<(), String> {
-    let egress = node.egress_for(None)?;
-    let qname = protocol::build_qname(verb::POLL, &node.cfg.node_id, 0, 0, "", &node.cfg.zone);
-    let resp = sender::exchange(node, egress, &qname)?;
-    let pkt = Packet::parse(&resp).map_err(|e| format!("poll response parse: {e}"))?;
+fn poll_once(node: &Arc<Node>) -> Result<(), String> {
+    let tag = node
+        .tag
+        .clone()
+        .ok_or("no `shared_key` configured: cannot derive a mailbox tag")?;
+    let candidates = node.egress_candidates(None);
+    if candidates.is_empty() {
+        return Err("no relay configured to poll".to_string());
+    }
 
-    // msg_id -> (seq, total, chunk)
-    let mut groups: HashMap<String, Vec<(u32, u32, String)>> = HashMap::new();
-    for rr in &pkt.answers {
-        if let RData::TXT(txt) = &rr.rdata {
-            for (k, _v) in txt.iter_raw() {
-                let s = String::from_utf8_lossy(k);
-                if let Some(rest) = s.strip_prefix("m:") {
-                    let parts: Vec<&str> = rest.splitn(4, ':').collect();
-                    if parts.len() == 4 {
-                        let seq = parts[1].parse().unwrap_or(0);
-                        let total = parts[2].parse().unwrap_or(1);
-                        groups.entry(parts[0].to_string()).or_default().push((
-                            seq,
-                            total,
-                            parts[3].to_string(),
-                        ));
-                    }
-                }
+    let mut reached = 0usize;
+    let mut last_error = String::new();
+    for egress in candidates {
+        match poll_egress(node, egress, &tag) {
+            Ok(()) => reached += 1,
+            Err(e) => {
+                node.log(format!("[!] poll via {egress} failed: {e}"));
+                last_error = e;
             }
         }
     }
+    if reached == 0 {
+        return Err(last_error);
+    }
+    Ok(())
+}
 
-    for (mid, mut chunks) in groups {
-        chunks.sort_by_key(|c| c.0);
-        let total = chunks.first().map(|c| c.1).unwrap_or(0);
-        if total == 0 || chunks.len() != total as usize {
-            continue;
+/// One poll against one relay: fetch, ingest and acknowledge.
+fn poll_egress(node: &Arc<Node>, egress: Egress, tag: &str) -> Result<(), String> {
+    let qname = protocol::build_qname(verb::POLL, tag, "", 0, 0, "", &node.cfg.zone);
+    let reply = sender::exchange(node, egress, &qname)?;
+
+    let blobs = reply.complete_blobs();
+    if blobs.is_empty() {
+        return Ok(());
+    }
+
+    let mut opened: Vec<String> = Vec::new();
+    for (mid, blob) in blobs {
+        match node.open_blob(&mid, &blob) {
+            Ok(env) => match node.ingest(&mid, &env) {
+                Ok(_) => opened.push(mid),
+                Err(e) => node.log(format!("[!] polled ingest {mid} failed: {e}")),
+            },
+            Err(e) => node.log(format!("[!] polled blob {mid} could not be opened: {e}")),
         }
-        let concat: String = chunks.iter().map(|c| c.2.clone()).collect();
-        match protocol::decode_blob(&node.key, &concat) {
-            Ok(env) => {
-                let peer_name = node
-                    .db
-                    .peer(&env.from)
-                    .map(|p| p.name)
-                    .unwrap_or_else(|| env.from.clone());
-                if let Ok(Some(_)) = node
-                    .db
-                    .insert_message(&mid, "in", &env.from, &peer_name, &env.body, "received")
-                {
-                    node.db.touch_peer(&env.from);
-                    node.log(format!(
-                        "[<] polled message {mid} from {}: {:?}",
-                        env.from, env.body
-                    ));
-                    node.notify_message();
-                }
-            }
-            Err(e) => node.log(format!("[!] polled blob decode failed for {mid}: {e}")),
+    }
+
+    // Acknowledge everything we opened (stored, duplicate or receipt): the
+    // relay can drop it, and we will not re-download it next time.
+    for batch in opened.chunks(ACK_BATCH) {
+        let ack = protocol::build_ack_qname(tag, batch, &node.cfg.zone);
+        if let Err(e) = sender::exchange(node, egress, &ack) {
+            node.log(format!("[~] mailbox ack via {egress} failed: {e}"));
+            break;
         }
     }
     Ok(())
