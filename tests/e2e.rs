@@ -569,3 +569,84 @@ fn resending_a_file_resumes_instead_of_duplicating() {
     node_a.stop();
     node_b.stop();
 }
+
+#[test]
+fn push_to_talk_voice_decodes_end_to_end() {
+    use dns_lab::voice::{Encoder, Mode, Packet, SAMPLE_RATE, Stream};
+
+    let db_b = Arc::new(Db::open_in_memory().unwrap());
+    let db_a = Arc::new(Db::open_in_memory().unwrap());
+
+    let node_b = node(node_cfg("bbbb5555", "127.0.0.1:11640", ""), &db_b);
+    node_b.start();
+    let node_a = node(
+        node_cfg("aaaa5555", "127.0.0.1:11639", "127.0.0.1:11640"),
+        &db_a,
+    );
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Stand in for the speaker: collect whatever the node decodes.
+    let (tx, rx) = std::sync::mpsc::channel();
+    node_b.set_voice_sink(tx);
+
+    // One second of 440 Hz "speech" at 8 kHz, packed 6 frames (120 ms) per
+    // packet — a short press.
+    let samples: Vec<i16> = (0..SAMPLE_RATE as usize)
+        .map(|i| {
+            let t = i as f64 / SAMPLE_RATE as f64;
+            (8000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as i16
+        })
+        .collect();
+    let mut encoder = Encoder::new(Mode::Bitrate3200, 6);
+    let mut packets = encoder.push(&samples);
+    packets.extend(encoder.flush());
+    assert!(
+        packets.len() >= 8,
+        "1 s at 120 ms per packet should be ~9 packets, got {}",
+        packets.len()
+    );
+    assert!(packets.last().unwrap().last, "the tail must be flagged");
+
+    for packet in &packets {
+        node_a
+            .send_voice("bbbb5555", packet)
+            .expect("voice packet should be accepted");
+    }
+
+    let mut stream = Stream::new();
+    let mut decoded: Vec<i16> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut finished = false;
+    while Instant::now() < deadline && !finished {
+        if let Ok((from, packet)) = rx.recv_timeout(Duration::from_millis(500)) {
+            assert_eq!(from, "aaaa5555", "voice must name its sender");
+            // Through the wire format exactly as a receiver sees it.
+            let reparsed = Packet::decode(&packet.encode()).expect("packet round trip");
+            let chunk = stream.push(&reparsed, std::time::Instant::now());
+            decoded.extend(chunk.pcm);
+            finished = chunk.finished;
+        }
+    }
+    assert!(finished, "the final packet never arrived");
+    assert_eq!(
+        decoded.len(),
+        packets.iter().map(|p| p.frames as usize).sum::<usize>() * 160,
+        "every coded frame must come back as 160 samples"
+    );
+    assert_eq!(stream.dropped, 0, "nothing should have arrived late");
+    let energy: f64 = decoded.iter().map(|s| (*s as f64).abs()).sum::<f64>() / decoded.len() as f64;
+    assert!(
+        energy > 100.0,
+        "decoded voice should not be silence: {energy}"
+    );
+
+    // Voice shows up in the history as one row per press.
+    let rows = db_b.messages_for("aaaa5555", 50);
+    assert!(
+        rows.iter().any(|m| m.body == "[voice]"),
+        "expected a voice row in B's conversation"
+    );
+
+    node_a.stop();
+    node_b.stop();
+}

@@ -15,12 +15,15 @@ pub mod identity;
 pub mod net;
 pub mod protocol;
 pub mod smaz;
+pub mod voice;
 
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 pub mod app;
 
-#[cfg(target_os = "android")]
-mod android;
+// Android speaks to the core over JNI from its Java UI (no egui on Android).
+// The feature lets the same code be built and exercised on the host.
+#[cfg(any(target_os = "android", feature = "jni-bridge"))]
+pub mod bridge;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};

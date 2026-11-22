@@ -31,14 +31,27 @@ impl Reply {
     }
 
     /// Group mailbox chunks by message id, keeping only complete messages.
+    ///
+    /// The result is in the order the relay offered them (first appearance in
+    /// the reply), **not** hash order: the relay writes mailbox rows oldest
+    /// first, and a caller replaying them out of order saw voice packets arrive
+    /// shuffled and text pushed late.
     pub fn complete_blobs(&self) -> Vec<(String, String)> {
         use std::collections::HashMap;
+        let mut order: Vec<&str> = Vec::new();
         let mut groups: HashMap<&str, Vec<&BlobChunk>> = HashMap::new();
         for b in &self.blobs {
-            groups.entry(b.msg_id.as_str()).or_default().push(b);
+            let entry = groups.entry(b.msg_id.as_str()).or_default();
+            if entry.is_empty() {
+                order.push(b.msg_id.as_str());
+            }
+            entry.push(b);
         }
-        let mut out = Vec::new();
-        for (mid, mut chunks) in groups {
+        let mut out = Vec::with_capacity(order.len());
+        for mid in order {
+            let Some(chunks) = groups.get_mut(mid) else {
+                continue;
+            };
             chunks.sort_by_key(|c| c.seq);
             chunks.dedup_by_key(|c| c.seq);
             let total = chunks.first().map(|c| c.total).unwrap_or(0);
@@ -140,6 +153,37 @@ mod tests {
             complete[0],
             ("cafebabe".to_string(), "Y3DPJBSW".to_string())
         );
+    }
+
+    #[test]
+    fn complete_blobs_keep_the_order_the_relay_offered() {
+        // The relay writes mailbox rows oldest first, and a client that applied
+        // them in hash order saw everything shuffled: voice packets arrived out
+        // of sequence and pushed text landed after later mail.
+        let raw = packet_with(&[
+            "m:aaaa0000:0:1:AAAA",
+            "m:aaaa0001:0:1:BBBB",
+            "m:aaaa0002:0:1:CCCC",
+            "m:aaaa0003:0:1:DDDD",
+        ]);
+        let reply = parse(&raw).unwrap();
+        let ids: Vec<String> = reply.complete_blobs().into_iter().map(|(m, _)| m).collect();
+        assert_eq!(ids, ["aaaa0000", "aaaa0001", "aaaa0002", "aaaa0003"]);
+
+        // And a multi-chunk blob does not reorder its neighbours.
+        let raw = packet_with(&[
+            "m:bbbb0001:0:1:ZZZZ",
+            "m:cccc0002:1:2:IIII",
+            "m:bbbb0000:0:1:YYYY",
+            "m:cccc0002:0:2:HHHH",
+        ]);
+        let ids: Vec<String> = parse(&raw)
+            .unwrap()
+            .complete_blobs()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        assert_eq!(ids, ["bbbb0001", "cccc0002", "bbbb0000"]);
     }
 
     #[test]

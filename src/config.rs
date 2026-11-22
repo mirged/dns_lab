@@ -45,6 +45,20 @@ fn default_max_bytes_per_route() -> i64 {
 fn default_rate_limit() -> u32 {
     40
 }
+fn default_voice_mode() -> u16 {
+    // Codec 2 at 3200 bps: 8 bytes per 20 ms frame. Clearer than 2400; both
+    // ends must agree, because the frame layout differs.
+    3200
+}
+fn default_voice_frames() -> u8 {
+    // 12 frames per packet = 240 ms of speech per envelope. Smaller means lower
+    // latency and more signature overhead per second of audio.
+    12
+}
+fn default_voice_buffer_ms() -> u32 {
+    // Audio held before playback starts; also the jitter absorption budget.
+    240
+}
 fn default_download_dir() -> String {
     "downloads".to_string()
 }
@@ -186,6 +200,22 @@ pub struct Config {
     pub download_dir: String,
     #[serde(default = "default_key")]
     pub shared_key: String,
+
+    /// Voice: Codec 2 bitrate. Both ends must use the same one.
+    #[serde(default = "default_voice_mode")]
+    pub voice_mode: u16,
+    /// Voice: Codec 2 frames per DNS packet (20 ms each).
+    #[serde(default = "default_voice_frames")]
+    pub voice_frames_per_packet: u8,
+    /// Voice: milliseconds of audio buffered before the speaker starts.
+    #[serde(default = "default_voice_buffer_ms")]
+    pub voice_buffer_ms: u32,
+
+    /// Set by [`Config::load`] when the file was missing or had to be given a
+    /// node id. The GUI then writes the file once; a config the user wrote by
+    /// hand is left alone, so its comments and ordering survive.
+    #[serde(skip)]
+    pub needs_write: bool,
 }
 
 impl Default for Config {
@@ -216,6 +246,10 @@ impl Default for Config {
             db_path: default_db_path(),
             download_dir: default_download_dir(),
             shared_key: default_key(),
+            voice_mode: default_voice_mode(),
+            voice_frames_per_packet: default_voice_frames(),
+            voice_buffer_ms: default_voice_buffer_ms(),
+            needs_write: false,
         }
     }
 }
@@ -223,7 +257,8 @@ impl Default for Config {
 impl Config {
     /// Load from a TOML file, creating defaults (and a fresh node id) if missing.
     pub fn load(path: &str) -> Config {
-        let mut cfg = if Path::new(path).exists() {
+        let existed = Path::new(path).exists();
+        let mut cfg = if existed {
             match std::fs::read_to_string(path) {
                 Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
                     eprintln!("[!] Failed to parse {path}: {e}; using defaults");
@@ -238,18 +273,26 @@ impl Config {
             Config::default()
         };
 
+        let had_node_id = !cfg.node_id.is_empty();
         if cfg.node_id.is_empty() {
             cfg.node_id = crate::random_id();
         }
-        // Resolve a relative database path against the config file's directory so
-        // it lands somewhere writable on all platforms (esp. Android, no cwd).
-        if Path::new(&cfg.db_path).is_relative()
-            && let Some(parent) = Path::new(path).parent()
+        cfg.needs_write = !existed || !had_node_id;
+        // Resolve relative paths against the config file's directory, so they
+        // land somewhere writable on all platforms (Android has no cwd).
+        //
+        // The result is made **absolute** on purpose: the GUI saves the config
+        // back, which writes these fields out. A relative result would then be
+        // resolved again on the next load, growing into `alice/alice/alice.db`.
+        if let Some(parent) = Path::new(path).parent()
             && !parent.as_os_str().is_empty()
+            && let Ok(dir) = parent.canonicalize()
         {
-            cfg.db_path = parent.join(&cfg.db_path).to_string_lossy().to_string();
+            if Path::new(&cfg.db_path).is_relative() {
+                cfg.db_path = dir.join(&cfg.db_path).to_string_lossy().to_string();
+            }
             if Path::new(&cfg.download_dir).is_relative() {
-                cfg.download_dir = parent.join(&cfg.download_dir).to_string_lossy().to_string();
+                cfg.download_dir = dir.join(&cfg.download_dir).to_string_lossy().to_string();
             }
         }
         cfg
@@ -318,6 +361,38 @@ mod tests {
         // Relative db paths resolve next to the config file.
         assert!(cfg.db_path.starts_with(&path[..path.rfind('/').unwrap()]));
         assert!(cfg.db_path.ends_with("dns_lab.db"));
+    }
+
+    #[test]
+    fn saving_and_reloading_does_not_grow_the_paths() {
+        // The GUI writes the config back after load. Resolving a *relative*
+        // result each time turned `alice.db` into `alice/alice/alice.db`.
+        let dir = std::env::temp_dir().join(format!("dns_lab_cfg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dns_lab.toml").to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut cfg = Config::load(&path);
+        cfg.db_path = "node.db".to_string();
+        cfg.download_dir = "downloads".to_string();
+        cfg.save(&path).unwrap();
+
+        let first = Config::load(&path).db_path.clone();
+        let second = Config::load(&path).db_path.clone();
+        assert_eq!(first, second, "a reload must be idempotent");
+        assert!(
+            Path::new(&first).is_absolute(),
+            "{first} should be absolute"
+        );
+        assert!(first.ends_with("node.db"));
+        assert_eq!(first.matches("node.db").count(), 1, "{first}");
+
+        // And a config that was saved with the resolved value keeps working.
+        let saved = Config::load(&path);
+        saved.save(&path).unwrap();
+        assert_eq!(Config::load(&path).db_path, first);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

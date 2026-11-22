@@ -23,7 +23,9 @@ use data_encoding::BASE32_NOPAD;
 use std::io::{Read, Write};
 
 /// Protocol version carried inside the encrypted envelope.
-pub const VERSION: u8 = 5;
+///
+/// 6 adds [`MsgType::Voice`]; 5 was signed envelopes with per-recipient keys.
+pub const VERSION: u8 = 6;
 
 /// Practical maximum presentation length of a DNS name.
 pub const MAX_QNAME: usize = 253;
@@ -65,6 +67,8 @@ pub enum MsgType {
     Heartbeat = 4,
     /// One part of a file transfer (see [`crate::file`]).
     File = 5,
+    /// One packet of a push-to-talk transmission (see [`crate::voice`]).
+    Voice = 6,
 }
 
 impl MsgType {
@@ -75,6 +79,7 @@ impl MsgType {
             3 => Some(MsgType::Read),
             4 => Some(MsgType::Heartbeat),
             5 => Some(MsgType::File),
+            6 => Some(MsgType::Voice),
             _ => None,
         }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "dns_lab"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Experimental DNS-tunneling messenger: encrypted, compressed chat carried inside DNS queries (RFC 1035)."
@@ -13,10 +13,17 @@ homepage = "https://github.com/mirged/dns_lab"
 
 [features]
 # Desktop GUI is the default for local development and end users.
-default = ["gui"]
+default = ["gui", "audio"]
 # Optional egui/eframe front-end. Disable with `--no-default-features` to build
 # the tiny headless server/CLI binary (no graphics stack pulled in).
 gui = ["dep:eframe"]
+# Microphone capture and speaker playback for push-to-talk voice. Kept separate
+# from `gui` so a headless relay can still receive voice (to disk) without a
+# sound stack, and so `--no-default-features` stays tiny.
+audio = ["dep:cpal"]
+# Build the JNI bridge on a non-Android host so its logic can be smoke-tested
+# from a plain JVM (see android/test/README.md). On Android it is always on.
+jni-bridge = []
 
 [dependencies]
 simple-dns = "0.12.0"
@@ -32,8 +39,18 @@ sha2 = "0.10"
 ed25519-dalek = { version = "3.0", default-features = false }
 curve25519-dalek = { version = "5.0", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Pure-Rust Codec 2 (LGPL-2.1/MIT): 3200 or 2400 bps speech, no C toolchain, so
+# the Android build needs no NDK cross-compilation for it.
+codec2 = "0.3.1"
+# Audio I/O for push-to-talk (feature `audio`): ALSA on Linux, AAudio on Android
+# (needs RECORD_AUDIO granted), CoreAudio/WASAPI elsewhere.
+cpal = { version = "0.18", optional = true }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# JNI surface used by the Android app's Java UI (src/bridge.rs). Harmless on
+# desktop, where the module is only compiled with the `jni-bridge` feature.
+jni = "0.21"
+ndk-context = "0.1"
 
 # Desktop GUI (X11/Wayland). Optional so the headless build never pulls winit.
 [target.'cfg(not(target_os = "android"))'.dependencies]
@@ -57,8 +74,22 @@ crate-type = ["rlib", "cdylib"]
 package = "com.dnslab.messenger"
 apk_name = "dns-lab"
 build_targets = ["aarch64-linux-android"]
-min_sdk_version = 24
+# The UI is plain Java (no AndroidX, no Gradle): cargo-apk2 compiles these
+# sources with javac against android.jar, dexes them and packages the APK.
+java_sources = "android/src"
+
+# These live under `[.sdk]`: they map to the manifest's <uses-sdk>, and
+# cargo-apk2 only reads them from there. Kept flat they are silently ignored
+# and the build defaults to API 24, where `-laaudio` (and voice) does not link.
+# API 26 (Android 8.0): AAudio, which cpal's Android backend needs for the
+# microphone and speaker, only exists from here. Chat worked on 24; voice does
+# not, and a device without AAudio would fail to open any audio stream.
+[package.metadata.android.sdk]
+min_sdk_version = 26
 target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "DNS Lab"
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
@@ -66,15 +97,18 @@ name = "android.permission.INTERNET"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.ACCESS_NETWORK_STATE"
 
-# NativeActivity launches our `android_main` in libdns_lab.so.
+# Push-to-talk. Android grants dangerous permissions at runtime, so on a phone
+# the first "hold to talk" may need Settings > Apps > DNS Lab > Permissions >
+# Microphone > Allow (the GUI reports the failure instead of crashing).
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
+
+# The activity is ours: a Java UI that talks to the Rust core over JNI.
 [[package.metadata.android.application.activity]]
-name = "android.app.NativeActivity"
+name = "com.dnslab.messenger.MainActivity"
+label = "DNS Lab"
 exported = true
 window_soft_input_mode = "adjustResize"
-
-[[package.metadata.android.application.activity.meta_data]]
-name = "android.app.lib_name"
-value = "dns_lab"
 
 [[package.metadata.android.application.activity.intent_filter]]
 actions = ["android.intent.action.MAIN"]

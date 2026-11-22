@@ -15,10 +15,12 @@ fn main() {
         "serve" | "relay" => serve(&args),
         "run" => run(&args),
         "send" => send(&args),
+        "voice" => voice(&args),
         "inbox" => inbox(&args),
         "files" => files(&args),
         "peers" => peers(&args),
         "id" => id(&args),
+        "tag" => tag(&args),
         "gui" => gui(&args),
         "-h" | "--help" | "help" => {
             usage();
@@ -59,14 +61,20 @@ fn usage() {
 USAGE:
   dns_lab gui    [--config FILE]              Desktop app (default command)
   dns_lab serve  [--config FILE]              Headless authoritative relay (VPS)
-  dns_lab run    [--config FILE]              Headless client daemon (listener + poller)
+  dns_lab run    [--config FILE] [--voice-save DIR]
+                                              Headless client daemon (listener + poller)
   dns_lab send   --to ID [--body TEXT|-]      Send one message from the CLI
   dns_lab send   --to ID --file PATH          Send a file (resumes if re-run)
   dns_lab inbox  [--limit N]                  Show recent messages
   dns_lab files  [--limit N]                  Show file transfers
+  dns_lab voice listen [--save DIR]           Play (or save) incoming push-to-talk voice
+  dns_lab voice send   --to ID --wav FILE     Send a WAV file as a voice transmission
+  dns_lab voice test   (--wav FILE|--tone S) [--out F]
+                                              Encode+decode offline, no network
   dns_lab peers  [--config FILE]              List known contacts
   dns_lab id     [--config FILE]              Print this node id
-  dns_lab version                             Print the version
+  dns_lab tag    --for ID [--config FILE]     Print the routing tag ID must answer
+  dns_lab version                             Show the version
 
 `--body -` reads the message from stdin. The config file defaults to
 $DNS_LAB_CONFIG, then ./dns_lab.toml."
@@ -147,6 +155,25 @@ fn run(args: &[String]) -> i32 {
     );
     println!("  Database:  {}", cfg.db_path);
     println!("Sending is done from another shell: `dns_lab send --to <id> --body ...`");
+
+    // `--voice-save DIR` turns the daemon into a voice recorder: incoming
+    // push-to-talk is decoded and written as `<dir>/voice-<stream>-<ts>.wav`.
+    #[allow(unused_variables)]
+    let voice = arg_value(args, "--voice-save");
+    if let Some(dir) = &voice {
+        println!("  Voice:     decoding to {dir}");
+    }
+    #[cfg(feature = "audio")]
+    let _voice = voice.clone().map(|dir| {
+        dns_lab::voice::audio::listen(&node, &cfg, Some(dir))
+            .map_err(|e| eprintln!("[!] voice receiver: {e}"))
+            .ok()
+    });
+    #[cfg(not(feature = "audio"))]
+    let _voice = voice.clone().map(|dir| {
+        println!("  Voice:     audio not compiled in, saving only");
+        dns_lab::voice::start_receiver(&node, None, Some(dir))
+    });
     if cfg.key_opt().is_none() {
         eprintln!("[!] no shared_key configured: this node cannot send, receive or route mail");
     }
@@ -208,6 +235,284 @@ fn send(args: &[String]) -> i32 {
             db.set_status(&msg_id, "queued");
             eprintln!("[!] send failed: {e}");
             1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// voice
+// ---------------------------------------------------------------------------
+
+fn voice(args: &[String]) -> i32 {
+    match args.get(1).map(|s| s.as_str()).unwrap_or("listen") {
+        "listen" | "rx" | "recv" => voice_listen(args),
+        "send" | "tx" => voice_send(args),
+        "test" => voice_test(args),
+        other => {
+            eprintln!("[!] unknown `voice` subcommand: {other}");
+            eprintln!("    voice listen | voice send --to ID --wav FILE | voice test --wav FILE");
+            2
+        }
+    }
+}
+
+/// Read a WAV, downmix to 8 kHz mono, and report what it contains.
+fn load_wav(path: &str) -> Result<(Vec<i16>, dns_lab::voice::wav::Wav), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let wav = dns_lab::voice::wav::read(&bytes).map_err(|e| format!("{path}: {e}"))?;
+    let pcm = dns_lab::voice::wav::to_mono_8k(&wav);
+    if pcm.is_empty() {
+        return Err(format!("{path} contains no audio"));
+    }
+    Ok((pcm, wav))
+}
+
+fn voice_mode(cfg: &Config) -> dns_lab::voice::Mode {
+    dns_lab::voice::Mode::from_bitrate(cfg.voice_mode)
+}
+
+/// Voiced-sounding test signal: a 140 Hz buzz with harmonics and a syllable
+/// envelope. Codec 2 is a speech vocoder, so a pure sine is a poor test.
+fn synth_voice(seconds: f32) -> Vec<i16> {
+    use std::f32::consts::TAU;
+    let n = (dns_lab::voice::SAMPLE_RATE as f32 * seconds) as usize;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / dns_lab::voice::SAMPLE_RATE as f32;
+            let syllabic = 0.55 + 0.45 * (TAU * 3.2 * t).sin();
+            let mut v = 0.0f32;
+            for (freq, amp) in [(140.0, 0.5), (280.0, 0.3), (560.0, 0.2), (1120.0, 0.12)] {
+                v += amp * (TAU * freq * t).sin();
+            }
+            (v * syllabic * 12_000.0).clamp(-32_768.0, 32_767.0) as i16
+        })
+        .collect()
+}
+
+/// Encode a WAV into packets, in memory. Shared by `send` and `test`.
+fn encode_wav(cfg: &Config, pcm: &[i16]) -> Vec<dns_lab::voice::Packet> {
+    let mut enc = dns_lab::voice::Encoder::new(voice_mode(cfg), cfg.voice_frames_per_packet);
+    let mut packets = enc.push(pcm);
+    if let Some(last) = enc.flush() {
+        packets.push(last);
+    }
+    packets
+}
+
+fn voice_send(args: &[String]) -> i32 {
+    let Some(to) = arg_value(args, "--to") else {
+        eprintln!("[!] --to ID is required");
+        return 2;
+    };
+    let Some(path) = arg_value(args, "--wav") else {
+        eprintln!("[!] --wav FILE is required (use `voice test` to check a clip offline)");
+        return 2;
+    };
+    let cfg = Config::load(&config_path(args));
+    let (pcm, wav) = match load_wav(&path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[!] {e}");
+            return 1;
+        }
+    };
+    let packets = encode_wav(&cfg, &pcm);
+    let mode = voice_mode(&cfg);
+    let speech_ms = pcm.len() as u64 * 1000 / dns_lab::voice::SAMPLE_RATE as u64;
+    println!(
+        "[*] {} ({}, {} Hz, {} ch) -> {:.1} s at codec2 {} bps",
+        path,
+        dns_lab::file::human_size(pcm.len() as u64 * 2),
+        wav.rate,
+        wav.channels,
+        speech_ms as f32 / 1000.0,
+        mode.bitrate()
+    );
+    println!(
+        "[*] {} packet(s) of {} frames ({} ms) to {to}",
+        packets.len(),
+        cfg.voice_frames_per_packet,
+        cfg.voice_frames_per_packet.max(1) as u32 * dns_lab::voice::FRAME_MS
+    );
+
+    let (node, _db) = open_node(cfg);
+    let mut queries = 0usize;
+    let mut failed = 0usize;
+    for packet in &packets {
+        match node.send_voice(&to, packet) {
+            Ok(q) => {
+                queries += q;
+                print!(
+                    "\r    packet {}/{} ({} queries)",
+                    packet.seq + 1,
+                    packets.len(),
+                    queries
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("\n[!] packet {} failed: {e}", packet.seq);
+            }
+        }
+    }
+    println!();
+    if failed == packets.len() {
+        eprintln!("[!] every packet failed");
+        return 1;
+    }
+    println!(
+        "[+] voice sent: {} queries, {} packet(s) failed",
+        queries, failed
+    );
+    0
+}
+
+/// Encode and immediately decode a file: proves the codec path works without
+/// any network or audio device.
+fn voice_test(args: &[String]) -> i32 {
+    let cfg = Config::load(&config_path(args));
+    let (pcm, wav) = match (arg_value(args, "--wav"), arg_value(args, "--tone")) {
+        (Some(path), _) => match load_wav(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[!] {e}");
+                return 1;
+            }
+        },
+        (None, Some(secs)) => {
+            let seconds: f32 = secs.parse::<f32>().unwrap_or(1.0).clamp(0.05, 30.0);
+            let samples = synth_voice(seconds);
+            (
+                samples.clone(),
+                dns_lab::voice::wav::Wav {
+                    rate: dns_lab::voice::SAMPLE_RATE,
+                    channels: 1,
+                    samples,
+                },
+            )
+        }
+        (None, None) => {
+            eprintln!("[!] pass --wav FILE or --tone SECONDS");
+            return 2;
+        }
+    };
+    let path = arg_value(args, "--wav")
+        .unwrap_or_else(|| format!("a {:.1} s tone", wav.duration_ms() as f32 / 1000.0));
+    let packets = encode_wav(&cfg, &pcm);
+    let coded: usize = packets.iter().map(|p| p.data.len()).sum();
+    let speech_ms = pcm.len() as u64 * 1000 / dns_lab::voice::SAMPLE_RATE as u64;
+
+    let mut stream = dns_lab::voice::Stream::new();
+    let mut decoded = Vec::new();
+    for packet in &packets {
+        // Through the wire format and back, exactly as the receiver sees it.
+        let body = packet.encode();
+        let parsed = match dns_lab::voice::Packet::decode(&body) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[!] packet {} did not round trip: {e}", packet.seq);
+                return 1;
+            }
+        };
+        decoded.extend(stream.push(&parsed, std::time::Instant::now()).pcm);
+        // A hole that never fills would hold the tail back; the test has none.
+        decoded.extend(stream.tick(std::time::Instant::now()));
+    }
+
+    println!("[+] {} -> codec2 {} bps", path, voice_mode(&cfg).bitrate());
+    println!(
+        "    input   {:.2} s @ {} Hz, {} channel(s)",
+        wav.duration_ms() as f32 / 1000.0,
+        wav.rate,
+        wav.channels
+    );
+    println!(
+        "    coded   {coded} bytes in {} packet(s), {:.1}% of 8 kHz 16-bit PCM",
+        packets.len(),
+        coded as f32 * 100.0 / (pcm.len() as f32 * 2.0).max(1.0)
+    );
+    println!(
+        "    decoded {:.2} s ({} frames){}",
+        decoded.len() as f32 / dns_lab::voice::SAMPLE_RATE as f32,
+        stream.played_frames,
+        if stream.filled_frames > 0 {
+            format!(", {} frame(s) filled", stream.filled_frames)
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "    airtime ~{} DNS quer{} at ~125 bytes per query",
+        packets.len() * 2,
+        if packets.len() * 2 == 1 { "y" } else { "ies" }
+    );
+    if let Some(out) = arg_value(args, "--out") {
+        let bytes = dns_lab::voice::wav::write(&decoded, dns_lab::voice::SAMPLE_RATE);
+        match std::fs::write(&out, bytes) {
+            Ok(()) => println!("[+] wrote {out}"),
+            Err(e) => {
+                eprintln!("[!] cannot write {out}: {e}");
+                return 1;
+            }
+        }
+    }
+    let expected = packets.iter().map(|p| p.frames as u64).sum::<u64>() * 20;
+    if speech_ms.abs_diff(expected) > 40 {
+        eprintln!("[!] coded duration {expected} ms does not match the input {speech_ms} ms");
+        return 1;
+    }
+    0
+}
+
+fn voice_listen(args: &[String]) -> i32 {
+    let cfg = Config::load(&config_path(args));
+    let save = arg_value(args, "--save");
+    let (node, _db) = open_node(cfg.clone());
+    node.start();
+
+    println!("DNS Lab voice listener {VERSION}");
+    println!("  Node id:   {}", cfg.node_id);
+    println!(
+        "  Codec:     codec2 {} bps, {} frames per packet",
+        voice_mode(&cfg).bitrate(),
+        cfg.voice_frames_per_packet
+    );
+    println!(
+        "  Saving:    {}",
+        save.clone()
+            .unwrap_or_else(|| "(no --save directory)".to_string())
+    );
+
+    #[cfg(feature = "audio")]
+    let _listen = match dns_lab::voice::audio::listen(&node, &cfg, save) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            eprintln!("[!] cannot start the audio path: {e}");
+            eprintln!("    hint: pass --save DIR to record transmissions instead of playing them");
+            return 1;
+        }
+    };
+    #[cfg(not(feature = "audio"))]
+    {
+        if save.is_none() {
+            eprintln!(
+                "[!] built without the `audio` feature: pass --save DIR to record voice to disk"
+            );
+            return 2;
+        }
+        let _keep = dns_lab::voice::start_receiver(&node, None, save);
+        println!("  Audio:     not compiled in (heads-up: --save only)");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+    #[cfg(feature = "audio")]
+    {
+        println!("[+] listening - hold to talk on the other device");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     }
 }
@@ -360,6 +665,25 @@ fn id(args: &[String]) -> i32 {
         node.tag.as_deref().unwrap_or("(needs a shared_key)")
     );
     println!("fingerprint {}", node.fingerprint());
+    0
+}
+
+/// The tag the *other* node must answer with. Each node's tag is
+/// `HKDF(shared_key, its own node_id)`, so two peers legitimately show
+/// different tags on their own screens; the pair only matches when the key and
+/// the ids agree. Cheap enough to compute without opening the node (no listener
+/// bind, no database), so it is safe to run while the GUI holds the port.
+fn tag(args: &[String]) -> i32 {
+    let cfg = Config::load(&config_path(args));
+    let Some(to) = arg_value(args, "--for") else {
+        eprintln!("[!] --for ID is required (the peer's node id)");
+        return 2;
+    };
+    let Some(key) = cfg.key_opt() else {
+        eprintln!("[!] no shared_key in this config: nothing to derive a tag from");
+        return 1;
+    };
+    println!("{}", dns_lab::routing_tag(&key, &to));
     0
 }
 

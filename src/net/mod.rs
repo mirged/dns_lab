@@ -108,6 +108,9 @@ pub struct Node {
     /// Ed25519 + X25519 identity, minted on first run.
     pub identity: Identity,
     pub events: Mutex<Sender<AppEvent>>,
+    /// Where decrypted voice packets go: the GUI (or `dns_lab voice listen`)
+    /// installs a channel here and plays whatever arrives.
+    pub voice: Mutex<Option<Sender<(String, crate::voice::Packet)>>>,
     pub stop: Arc<AtomicBool>,
 }
 
@@ -130,6 +133,7 @@ impl Node {
             tag,
             identity,
             events: Mutex::new(events),
+            voice: Mutex::new(None),
             stop: Arc::new(AtomicBool::new(false)),
         }))
     }
@@ -320,8 +324,27 @@ impl Node {
         msg_id: &str,
         conv_seq: u64,
     ) -> Result<usize, String> {
+        self.transmit(
+            to,
+            MsgType::Message,
+            body.as_bytes().to_vec(),
+            msg_id,
+            conv_seq,
+        )
+    }
+
+    /// Seal one envelope of any type and push it out through the first egress
+    /// that accepts it. Returns the number of DNS queries used.
+    fn transmit(
+        self: &Arc<Self>,
+        to: &str,
+        msg_type: MsgType,
+        body: Vec<u8>,
+        msg_id: &str,
+        conv_seq: u64,
+    ) -> Result<usize, String> {
         let (payload_key, alg, include_bundle, peer_has_key) = self.seal_params(to)?;
-        let mut env = Envelope::new(MsgType::Message, &self.cfg.node_id, to, body)
+        let mut env = Envelope::new_bytes(msg_type, &self.cfg.node_id, to, body)
             .with_seq(conv_seq)
             .with_alg(alg)
             .with_peer_has_key(peer_has_key);
@@ -351,6 +374,28 @@ impl Node {
             }
         }
         Err(last_error)
+    }
+
+    /// Send one push-to-talk packet to a peer.
+    ///
+    /// Fire and forget on purpose: a voice packet that misses its moment is
+    /// worthless, so it never enters the outbox and never waits for a receipt.
+    /// The packet id is deterministic per `(stream, seq)`, so a retry at the
+    /// transport level is deduplicated instead of played twice.
+    pub fn send_voice(
+        self: &Arc<Self>,
+        to: &str,
+        packet: &crate::voice::Packet,
+    ) -> Result<usize, String> {
+        if self.key.is_none() {
+            return Err("no `shared_key` configured: cannot route voice".to_string());
+        }
+        self.transmit(to, MsgType::Voice, packet.encode(), &packet.msg_id(), 0)
+    }
+
+    /// Install the sink for inbound voice packets (one per process is enough).
+    pub fn set_voice_sink(&self, tx: Sender<(String, crate::voice::Packet)>) {
+        *self.voice.lock().unwrap() = Some(tx);
     }
 
     /// Send `data` as a named file transfer.
@@ -790,11 +835,55 @@ impl Node {
                 Ok(Ingested::Stored)
             }
             MsgType::File => self.ingest_file_part(msg_id, env),
+            MsgType::Voice => self.ingest_voice(msg_id, env),
             other => {
                 self.log(format!("[~] ignoring {other:?} from {}", env.from));
                 Ok(Ingested::Ignored)
             }
         }
+    }
+
+    /// Hand one decrypted voice packet to the player.
+    ///
+    /// Nothing is acknowledged and nothing is assembled: the packet either
+    /// arrives in time to be played or it does not. The first packet of a press
+    /// writes one chat row, so voice shows up in the history next to text.
+    fn ingest_voice(self: &Arc<Self>, msg_id: &str, env: &Envelope) -> Result<Ingested, String> {
+        let packet = crate::voice::Packet::decode(&env.body)?;
+        if packet.msg_id() != msg_id {
+            return Err(format!(
+                "voice packet {msg_id} carries the id of another packet ({})",
+                packet.msg_id()
+            ));
+        }
+        if packet.seq == 0 {
+            let peer_name = self
+                .db
+                .peer(&env.from)
+                .map(|p| p.name)
+                .unwrap_or_else(|| env.from.clone());
+            let _ = self
+                .db
+                .insert_message(msg_id, "in", &env.from, &peer_name, "[voice]", "received");
+            self.db.touch_peer(&env.from);
+            self.log(format!(
+                "[<] voice from {} ({})",
+                env.from,
+                packet.mode.label()
+            ));
+            self.notify_message();
+        }
+        if self.cfg.verbose && packet.last {
+            self.log(format!(
+                "[<] voice from {} ended (#{:04x} seq {})",
+                env.from, packet.stream, packet.seq
+            ));
+        }
+        // No player installed (headless relay, tests): the packet is simply done.
+        if let Some(tx) = self.voice.lock().unwrap().clone() {
+            let _ = tx.send((env.from.clone(), packet));
+        }
+        Ok(Ingested::Ignored)
     }
 
     /// Open and ingest blobs the relay pushed back in an ack reply.

@@ -4,6 +4,90 @@ All notable changes to this project. The wire format is unstable: any `VERSION`
 bump below is a deliberate compatibility break, and every node must be updated
 together.
 
+## 0.7.0 — push-to-talk voice
+
+Wire `VERSION` 6. Every node must be updated together: a v6 node and a v5 node
+cannot talk at all.
+
+### Voice
+
+- **Codec 2 push-to-talk.** Hold the button, speak, release; the clip is
+  compressed at 3200 bps (or 2400), framed into `MsgType::Voice` envelopes and
+  sent over the same signed, encrypted, chunked DNS path as text. No new
+  transport, no new keys, no receipt: voice packets ride the existing sender and
+  are deduplicated by their deterministic `stream||seq` id.
+  Measured with `dns_lab voice test --tone 1.0`: 1 s of speech = 400 coded
+  bytes (2.5 % of 8 kHz PCM) in 5 packets, ~10 DNS queries.
+- **Packet format** `DLV1 | stream | seq | first_frame | mode | frames | flags`
+  plus whole 20 ms frames. 15-byte header, 6 or 8 bytes per frame, up to 48
+  frames per packet, strictly validated on the way in.
+- **Silence is not transmitted.** A packet whose frames are all below the
+  silence floor never becomes a query; the receiver inserts the gap. The final
+  packet of a press always goes out, so the receiver knows to play out its tail.
+- **The receiver is a jitter buffer, not an assembler.** Packets are applied to
+  a continuous 8 kHz stream by frame index: gaps are filled with silence, late
+  packets are dropped, a new `stream` id flushes the old one and resets the
+  codec state. Playback starts once one packet's worth is buffered
+  (`voice_buffer_ms`), and any backlog past eight packets is dropped so latency
+  cannot creep.
+- **GUI**: a hold-to-talk button under the composer (works with mouse and touch),
+  a "receiving voice" indicator, and Setup → Voice for bitrate, frames per packet
+  and buffer.
+- **CLI**: `run --voice-save DIR` decodes inbound voice to WAV (a headless
+  recorder), `voice listen --save DIR` is a listener with no chat window,
+  `voice send --to ID --wav FILE` transmits a file (no microphone required), and
+  `voice test (--wav FILE|--tone S)` proves the codec path offline.
+- **Purity/portability**: Codec 2 is the pure-Rust `codec2` crate (LGPL-2.1/MIT),
+  so the Android build needs no NDK-provided C library; audio I/O is `cpal`,
+  behind the new optional `audio` feature so a headless build stays dependency
+  light. `--no-default-features` still compiles and still saves voice to disk.
+- **Android**: `RECORD_AUDIO` is declared; because a native activity cannot show
+  the runtime prompt, the first press may report *microphone unavailable* until
+  it is granted under Settings → Apps → Permissions.
+
+### Build
+
+- **The APK actually builds again.** `min_sdk_version` / `target_sdk_version`
+  sat loose in `[package.metadata.android]`, where cargo-apk2 ignores them and
+  falls back to API 24 — and API 24 has no `libaaudio.so`, so the link died on
+  `-laaudio`. They now live in `[package.metadata.android.sdk]` and the APK is
+  `minSdkVersion 26 / targetSdkVersion 34` (verified with `aapt2 dump badging`).
+- **JDK 17 is required, and enforced.** R8 in build-tools 34 refuses class files
+  from JDK 21/25 (`Unsupported class file major version 65/69`) *after* the
+  native link, which looks like a signing bug. `build-apk.sh` now prefers a JDK
+  17 at `$ANDROID_HOME/jdk` and refuses a newer one up front.
+- `deploy/android/install-sdk.sh` also installs Temurin 17 next to the SDK, so
+  one command gets a working toolchain without root.
+
+### Android UI (rewritten)
+
+- **egui is gone from the phone.** The Android app is now a plain Java UI
+  (`android/src/`, no AndroidX, no Gradle) over a 14-method JNI bridge
+  (`src/bridge.rs`). cargo-apk2 still does the whole build — `javac` against
+  `android.jar`, `d8` for the dex — so there is no second build system to keep
+  in sync, and the APK drops from 3.4 MB to 1.4 MB because the graphics stack is
+  no longer linked.
+- **Push-to-talk is a toggle**: tap to start, tap again to send. Press-and-hold
+  was unusable on a phone — a thumb cannot hold the button and read the screen,
+  and the `is_pointer_button_down_on()` test that worked with a mouse does not
+  match what touch delivers. The button turns red and reads "Talking - tap to
+  send".
+- **One column, large targets**: contact list → conversation → composer, with a
+  bottom bar for Chats / Setup / Log, dp-based sizing and the platform density
+  instead of a UI-scale multiplier. Microphone permission is requested at
+  runtime, the first time you tap talk.
+- **The bridge is testable without a phone.** `--features jni-bridge` builds the
+  same code for the host, and `scripts/android_bridge_test.sh` drives it from a
+  desktop JVM against a real peer node (`Java -> JNI -> DNS -> peer ->
+  receipt`). `Native.init(Activity)` hands the JVM and context to `ndk_context`,
+  which cpal's AAudio backend requires once there is no `android-activity`
+  around to do it.
+
+### Notes for upgraders
+
+- `VERSION` 5 → 6: old and new nodes are mutually unreadable, by design.
+- `voice_*` config keys are optional and default to 3200 bps / 12 frames / 240 ms.
+
 ## 0.6.1 — measured on a real emulated network
 
 ### Performance

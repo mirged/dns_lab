@@ -131,6 +131,11 @@ In **resolver** mode the client sends to a public recursive resolver
 - **File transfer**: up to 32 MiB, split into 8 KiB parts that travel as normal
   messages, verified against a SHA-256 end to end, resumable after a failure and
   written to `download_dir` only once every part has arrived and hashed.
+- **Push-to-talk voice**: hold the button, speak, release — Codec 2 at 3200 or
+  2400 bps compresses 20 ms into 6–8 bytes, and the coded frames ride the same
+  signed, encrypted envelopes as text. A 1 s transmission is ~400 bytes (~10
+  DNS queries); silence is not sent at all. Both ends agree on the bitrate
+  (`voice_mode`).
 - **Relay failover**: `relays = [...]` adds fallback relays after the primary.
   Sending stops at the first one that accepts the message; polling asks all of
   them, so mail parked on a secondary relay is still collected.
@@ -353,11 +358,22 @@ Full delegation and verification notes live in [`deploy/README.md`](deploy/READM
 > The Android app is a **barebones technical proof-of-concept**. The UI is
 > rough, scaling is basic, and it is a protocol demo — not a consumer messenger.
 
-The Android client uses resolver/relay mode (phones cannot bind port 53) and
-reuses the same Rust protocol, crypto, and SQLite code via NativeActivity.
+The Android client reuses the same Rust protocol, crypto, SQLite and voice code,
+but the UI is **plain Java** (`android/src/`, no AndroidX, no Gradle) talking to
+the core over JNI — egui is desktop-only now. cargo-apk2 compiles the Java with
+`javac`, dexes it and packages the APK, so the whole build is still one script
+and one toolchain. The screen is a contact list, a conversation with large touch
+targets, a Setup tab and a log; push-to-talk is tap-to-start / tap-to-stop,
+because holding a button with one thumb while reading the transcript is not a
+thing.
+
+The Android client works in direct (LAN) or resolver/relay mode; it never needs
+port 53.
 
 Prerequisites: `rustup target add aarch64-linux-android`, `cargo-apk2`, Android
-SDK/NDK, JDK 17, and a signing keystore. Then:
+SDK/NDK, JDK 17, and a signing keystore. `./deploy/android/install-sdk.sh`
+installs the SDK, build-tools 34, NDK r27 and Temurin 17 under `~/android-sdk`
+without root (a ~1 GB download, resumable). Then:
 
 ```sh
 export ANDROID_HOME=... ANDROID_NDK_HOME=... JAVA_HOME=...
@@ -370,6 +386,67 @@ adb install -r target/release/apk/dns-lab.apk
 
 See [`deploy/android/README.md`](deploy/android/README.md) for the full toolchain
 and runtime details.
+
+To test it against a laptop on the same Wi-Fi (no relay, no domain):
+
+```sh
+./scripts/lan_test.sh setup    # writes ~/dns-lab-lan/laptop.toml, prints the
+                               # exact values to type into the phone's Setup tab
+./scripts/lan_test.sh up       # laptop GUI on 0.0.0.0:5354
+```
+
+## Push-to-talk voice
+
+Voice is a *walkie-talkie*, not a phone call: the DNS tunnel is request/response
+with a round trip of tens to hundreds of milliseconds, so speak-then-listen is
+the model that works. Expect roughly a second between pressing the button and
+sound at the other end (one packet of speech is buffered before it is sent, and
+one packet is buffered before it is played).
+
+Desktop: hold **Hold to talk** in the composer, release to send. Incoming voice
+plays through the default speaker; the same row shows a green "receiving voice"
+dot while it is decoding.
+
+Headless, which is how the phone → PC test works:
+
+```sh
+# on the PC: play what arrives, and also keep each transmission as a WAV
+dns_lab run --config pc.toml --voice-save ./voice-in
+
+# or a listener with no chat side at all
+dns_lab voice listen --config pc.toml --save ./voice-in
+
+# send a clip from anywhere (no microphone needed: any WAV, any rate)
+dns_lab voice send --config phone.toml --to <pc-node-id> --wav clip.wav
+
+# check the codec path offline, with no network and no devices
+dns_lab voice test --tone 1.0 --out decoded.wav
+```
+
+Settings (config, or Setup → Voice in the GUI): `voice_mode` = `3200` or
+`2400` bps (**both ends must match**), `voice_frames_per_packet` = 12 (20 ms
+frames; 12 packs 240 ms of speech into one DNS packet) and `voice_buffer_ms` =
+240 (playback cushion; raise it on a lossy link, lower it for snappier turnaround).
+
+Cost, measured with `voice test`: 1 s of speech is 400 bytes configured as
+3200 bps — 2.5 % of 8 kHz 16-bit PCM — carried in 5 packets, about 10 DNS
+queries. At the default `rate_limit_per_sec = 40` that is a comfortable
+sustained talk rate.
+
+Through a **mailbox relay** two settings matter, because a poll reply carries
+whole blobs only: a voice packet is ~500 bytes of mailbox text, so the default
+`edns_udp_size = 1232` fits just two per poll and chops a one-second press into
+three deliveries. For voice, set `edns_udp_size = 4096` and keep
+`poll_interval_secs = 1`; a press then arrives in a single reply. Out-of-order
+and batched delivery is handled anyway — decoded frames are buffered by frame
+index, played as soon as they are contiguous, and a hole is held for one poll
+interval (`700 ms + poll_interval`) before it becomes silence.
+
+Android: the manifest declares `RECORD_AUDIO`, but Android grants dangerous
+permissions at runtime and a native activity cannot show the prompt itself, so
+the first press may fail with *microphone unavailable*. Grant it once under
+**Settings → Apps → DNS Lab → Permissions → Microphone → Allow**; the GUI then
+opens the microphone on the next press. Playback needs no permission.
 
 ## Configuration
 
@@ -401,12 +478,15 @@ environment variable (default: `dns_lab.toml`).
 | `timeout_ms` / `retries` | `800` / `3` | Per-query UDP timeout and retries |
 | `db_path` | `dns_lab.db` | SQLite file (relative → next to config) |
 | `shared_key` | *empty* | Passphrase for clients (identical on every node that sends/reads). **Empty = no key**: the node cannot encrypt, and a relay becomes a blind forwarder |
+| `voice_mode` | `3200` | Codec 2 bitrate: `3200` or `2400` (**both ends must match**) |
+| `voice_frames_per_packet` | `12` | 20 ms frames per DNS packet (12 = 240 ms per query) |
+| `voice_buffer_ms` | `240` | Audio buffered before playback starts |
 | `peers` | `[]` | `[[peers]]` with `id` / `name` / `addr` / `via` |
 
 ## Wire format
 
 All of this is internal, unstable, and versioned by the `VERSION` byte inside
-the encrypted envelope. Bumping it (currently `5`) breaks compatibility on
+the encrypted envelope. Bumping it (currently `6`) breaks compatibility on
 purpose.
 
 - **Routing tag.** `tag = lower_hex(HKDF-SHA256(key, salt="dns_lab/v4-route",
@@ -432,7 +512,7 @@ purpose.
   ```
 
   `msg_type`: 1 = message, 2 = delivery receipt, 3 = read marker, 4 = heartbeat,
-  5 = file part.
+  5 = file part, 6 = voice packet.
   `alg`: 0 = shared group key, 1 = X25519 per-recipient key. `flags` carries
   `bundle` (a 64-byte Ed25519‖X25519 bundle follows) and `peer_has_key` (I hold
   *your* bundle, so you can switch to `alg = 1`). `codec`: 0 = raw, 1 = SMAZ,
@@ -461,6 +541,19 @@ purpose.
   at 32 MiB, and `part-bytes` lets the receiver sanity-check the frame before it
   touches the database. Per-part message ids are `<transfer-id><part-in-hex>`,
   so a retried part cannot become a second copy.
+- **Voice packets** carry a compact binary header, then whole Codec 2 frames:
+
+  ```
+  DLV1 | stream(2, LE) | seq(2, LE) | first_frame(4, LE) | mode(1) | frames(1) | flags(1) | frames
+  ```
+
+  `mode` is 1 = 2400 bps (6 bytes per frame) or 2 = 3200 bps (8 bytes); `flags`
+  bit 0 marks the last packet of the press. One press is a *stream*: a random
+  16-bit id, contiguous frame indices, and a `last` marker. The packet id is
+  `stream||seq` in hex, so a transport retry dedupes instead of playing twice.
+  Voice is never receipted and never enters the outbox: a packet that misses its
+  moment is worthless. The receiver fills frames the sender skipped (silence) or
+  the network lost with silence, and drops packets that are already too late.
 - **Relay behaviour:** with a tag that is not its own, a relay buffers chunks by
   `(tag, msg-id)`, concatenates them once `total` are present, stores the blob
   under the tag and deletes the chunks — one transaction per chunk. It never

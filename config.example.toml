@@ -81,6 +81,16 @@ download_dir = "downloads"
 # Generate one with: openssl rand -base64 32   (or the GUI's "generate" button)
 shared_key = "CHANGE-ME-to-a-long-random-secret"
 
+# Push-to-talk voice.
+# Codec 2 bitrate: 3200 (64 bits/frame) or 2400 (48 bits/frame). Both ends must
+# use the same value or the frames decode as noise.
+voice_mode = 3200
+# Codec 2 frames per DNS packet, 20 ms each. 12 packs 240 ms of speech into one
+# query; fewer means lower latency, more means less signature overhead per second.
+voice_frames_per_packet = 12
+# Audio buffered before the speaker starts. Raise it on a lossy link.
+voice_buffer_ms = 240
+
 # Known contacts. `via = "direct"` uses `addr`; `via = "relay"` routes through
 # the configured relay/direct_server. Names are cosmetic.
 [[peers]]

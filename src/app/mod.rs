@@ -66,6 +66,17 @@ pub struct App {
     #[allow(dead_code)]
     platform: Option<PlatformHandle>,
     zoom_applied: bool,
+
+    /// Push-to-talk: the microphone is open while this is `Some`.
+    #[cfg(feature = "audio")]
+    voice_in: Option<crate::voice::audio::Recorder>,
+    /// Voice playback and the thread that decodes incoming packets into it.
+    #[cfg(feature = "audio")]
+    voice_out: Option<crate::voice::audio::Listen>,
+    /// Set when a press could not open the microphone, so a held button does not
+    /// retry (and log the same failure) on every frame.
+    #[cfg(feature = "audio")]
+    talk_failed: bool,
 }
 
 impl App {
@@ -98,6 +109,12 @@ impl App {
             android_scale: None,
             platform: None,
             zoom_applied: false,
+            #[cfg(feature = "audio")]
+            voice_in: None,
+            #[cfg(feature = "audio")]
+            voice_out: None,
+            #[cfg(feature = "audio")]
+            talk_failed: false,
         };
         app.start();
         app
@@ -150,7 +167,12 @@ impl App {
     }
 
     fn start(&mut self) {
-        let _ = self.cfg.save(&self.config_path);
+        // Only write the file when we had to invent something (a fresh node id
+        // or a brand-new config). Otherwise a hand-written config would lose
+        // its comments the first time the window opens.
+        if self.cfg.needs_write && self.cfg.save(&self.config_path).is_ok() {
+            self.cfg.needs_write = false;
+        }
         match Db::open(&self.cfg.db_path) {
             Ok(db) => {
                 let db = Arc::new(db);
@@ -186,6 +208,13 @@ impl App {
                             .to_string(),
                     );
                 }
+                #[cfg(feature = "audio")]
+                match crate::voice::audio::listen(&node, &self.cfg, None) {
+                    Ok(rx) => self.voice_out = Some(rx),
+                    Err(e) => {
+                        self.log(format!("[~] voice playback disabled: {e}"));
+                    }
+                }
                 self.status = format!("online as {}", self.cfg.node_id);
                 self.db = Some(db);
                 self.node = Some(node);
@@ -198,6 +227,14 @@ impl App {
     }
 
     fn stop(&mut self) {
+        #[cfg(feature = "audio")]
+        {
+            // Close the microphone and the speaker before the node goes away.
+            if let Some(rec) = self.voice_in.take() {
+                rec.stop();
+            }
+            self.voice_out = None;
+        }
         if let Some(node) = &self.node {
             node.stop();
         }
@@ -399,6 +436,136 @@ impl App {
         self.dirty = true;
     }
 
+    /// Open the microphone for a push-to-talk transmission to the selected
+    /// contact. Failure is reported, never fatal: a phone with the microphone
+    /// permission denied should still send text.
+    #[cfg(feature = "audio")]
+    fn start_talk(&mut self) {
+        if self.voice_in.is_some() {
+            return;
+        }
+        let Some(peer) = self.selected.clone() else {
+            self.log("[!] pick a contact before talking".to_string());
+            return;
+        };
+        let Some(node) = self.node.clone() else {
+            self.log("[!] cannot talk: node is stopped".to_string());
+            return;
+        };
+        let mode = crate::voice::Mode::from_bitrate(self.cfg.voice_mode);
+        match crate::voice::audio::Recorder::start(
+            node,
+            peer.clone(),
+            mode,
+            self.cfg.voice_frames_per_packet,
+        ) {
+            Ok(rec) => {
+                self.log(format!(
+                    "[*] talking to {peer}: codec2 {} bps, {} ms per packet ({} mic)",
+                    mode.bitrate(),
+                    self.cfg.voice_frames_per_packet.max(1) as u32 * crate::voice::FRAME_MS,
+                    rec.device()
+                ));
+                self.voice_in = Some(rec);
+            }
+            Err(e) => {
+                self.log(format!("[!] microphone unavailable: {e}"));
+                #[cfg(target_os = "android")]
+                self.log(
+                    "[!] grant it in Android settings: Apps > DNS Lab > Permissions > Microphone"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    /// Stop recording; the encoder thread sends the tail and logs the totals.
+    #[cfg(feature = "audio")]
+    fn stop_talk(&mut self) {
+        if let Some(rec) = self.voice_in.take() {
+            rec.stop();
+        }
+    }
+
+    /// `true` while this node is recording or playing voice.
+    fn voice_active(&self) -> bool {
+        #[cfg(feature = "audio")]
+        {
+            self.voice_in.is_some() || self.voice_out.as_ref().is_some_and(|l| l.playing())
+        }
+        #[cfg(not(feature = "audio"))]
+        {
+            false
+        }
+    }
+
+    /// The hold-to-talk button, plus a "receiving" indicator.
+    fn talk_row(&mut self, ui: &mut egui::Ui) {
+        #[cfg(feature = "audio")]
+        {
+            let talking = self.voice_in.is_some();
+            let label = if talking {
+                "TALKING - release to send"
+            } else {
+                "Hold to talk"
+            };
+            let fill = if talking {
+                egui::Color32::from_rgb(150, 45, 45)
+            } else {
+                egui::Color32::from_rgb(45, 55, 65)
+            };
+            let height = if self.android_scale.is_some() {
+                44.0
+            } else {
+                30.0
+            };
+            let button = egui::Button::new(egui::RichText::new(label).strong())
+                .fill(fill)
+                .min_size(egui::vec2(ui.available_width(), height));
+            let resp = ui
+                .add(button)
+                .on_hover_text("Codec 2 voice over the same encrypted DNS path as text");
+            let held = resp.is_pointer_button_down_on();
+            if held && !talking && !self.talk_failed {
+                self.start_talk();
+                // Only retry after the button is released, not every frame.
+                self.talk_failed = self.voice_in.is_none();
+            } else if !held {
+                if talking {
+                    self.stop_talk();
+                }
+                self.talk_failed = false;
+            }
+            if talking {
+                ui.ctx().request_repaint_after(Duration::from_millis(60));
+            }
+            let playing = self
+                .voice_out
+                .as_ref()
+                .map(|r| r.playing())
+                .unwrap_or(false);
+            if playing {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(10.0, ui.spacing().interact_size.y),
+                        egui::Sense::hover(),
+                    );
+                    let color = egui::Color32::from_rgb(90, 180, 110);
+                    ui.painter().circle_filled(rect.center(), 4.0, color);
+                    ui.label(egui::RichText::new("receiving voice").color(color));
+                });
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
+            if self.voice_out.is_none() {
+                ui.weak("no speaker available - incoming voice is not played");
+            }
+        }
+        #[cfg(not(feature = "audio"))]
+        {
+            ui.weak("voice needs the `audio` feature (rebuild without --no-default-features)");
+        }
+    }
+
     // ---- UI ------------------------------------------------------------
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -561,6 +728,7 @@ impl App {
                         self.send_attached();
                     }
                 });
+                self.talk_row(ui);
                 ui.add_space(2.0);
             });
 
@@ -857,6 +1025,40 @@ impl App {
                     });
 
                 ui.separator();
+                ui.label(egui::RichText::new("Voice (push-to-talk)").strong());
+                egui::Grid::new("cfg_voice")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Codec 2 bitrate");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut self.cfg.voice_mode, 3200, "3200")
+                                .on_hover_text("64 bits per 20 ms frame - clearer, more airtime");
+                            ui.selectable_value(&mut self.cfg.voice_mode, 2400, "2400")
+                                .on_hover_text("48 bits per 20 ms frame - 25% less airtime");
+                            ui.weak("both ends must match");
+                        });
+                        ui.end_row();
+
+                        ui.label("Frames per packet");
+                        ui.add(
+                            egui::DragValue::new(&mut self.cfg.voice_frames_per_packet)
+                                .range(1..=48),
+                        )
+                        .on_hover_text(
+                            "20 ms per frame: 12 frames pack 240 ms of speech into one DNS packet",
+                        );
+                        ui.end_row();
+
+                        ui.label("Playback buffer (ms)");
+                        ui.add(egui::DragValue::new(&mut self.cfg.voice_buffer_ms).range(40..=2000))
+                            .on_hover_text(
+                                "Audio held before the speaker starts: more absorbs jitter, less feels snappier",
+                            );
+                        ui.end_row();
+                    });
+
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         match self.cfg.save(&self.config_path) {
@@ -1038,7 +1240,11 @@ impl eframe::App for App {
             }
         }
 
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
+        // Faster ticks while the microphone is open or audio is playing, so the
+        // button state and the "receiving" dot keep up.
+        let interval = if self.voice_active() { 100 } else { 500 };
+        ui.ctx()
+            .request_repaint_after(Duration::from_millis(interval));
     }
 }
 

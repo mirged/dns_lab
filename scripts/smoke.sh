@@ -3,7 +3,8 @@
 #
 # Exercises the real binary (not the library) end to end:
 #   relay `serve`  <-  client A `send`  ->  client B `run` (poller) -> receipt
-#   and a 40 KB file, checked byte for byte against its sha256.
+#   and a 40 KB file, checked byte for byte against its sha256, and a
+#   push-to-talk voice transmission decoded to WAV on the far side.
 #
 # Usage: ./scripts/smoke.sh [path-to-binary]
 # Defaults to target/release/dns_lab (falls back to target/debug/dns_lab).
@@ -68,7 +69,8 @@ write_client b bbbb2222 "$B_ADDR"
 echo "[*] starting relay, A and B on $RELAY_ADDR"
 "$BIN" serve --config "$WORK/relay.toml" > "$WORK/relay.log" 2>&1 & RELAY_PID=$!
 "$BIN" run   --config "$WORK/a.toml"     > "$WORK/a.log"     2>&1 & A_PID=$!
-"$BIN" run   --config "$WORK/b.toml"     > "$WORK/b.log"     2>&1 & B_PID=$!
+"$BIN" run   --config "$WORK/b.toml" --voice-save "$WORK/voice-b" \
+                                                      > "$WORK/b.log"     2>&1 & B_PID=$!
 sleep 1.5
 
 echo "[*] sending A -> B"
@@ -135,6 +137,36 @@ if "$BIN" files --config "$WORK/b.toml" | grep -q "sample.bin"; then
   echo "  ok   transfer recorded on the receiving side"
 else
   echo "  FAIL transfer not recorded"
+  fail=1
+fi
+
+echo "[*] codec round trip (no network, no microphone)"
+if "$BIN" voice test --tone 1.0 --out "$WORK/clip.wav" | tee "$WORK/codec.log" | grep -q "decoded 1.00 s"; then
+  echo "  ok   $(grep -o 'coded .* PCM' "$WORK/codec.log" | head -1)"
+else
+  echo "  FAIL codec round trip"
+  cat "$WORK/codec.log"
+  fail=1
+fi
+
+echo "[*] sending push-to-talk voice A -> B"
+"$BIN" voice send --config "$WORK/a.toml" --to bbbb2222 --wav "$WORK/clip.wav" \
+  > "$WORK/voice-send.log" 2>&1 || { echo "  FAIL voice send"; tail -5 "$WORK/voice-send.log"; fail=1; }
+for _ in $(seq 1 80); do
+  if ls "$WORK"/voice-b/*.wav >/dev/null 2>&1; then break; fi
+  sleep 0.25
+done
+got_voice=$(ls "$WORK"/voice-b/*.wav 2>/dev/null | head -1)
+if [ -n "$got_voice" ] && [ "$(stat -c%s "$got_voice")" -gt 1000 ]; then
+  echo "  ok   voice arrived and decoded ($(stat -c%s "$got_voice") bytes of 8 kHz PCM)"
+else
+  echo "  FAIL voice transmission"
+  fail=1
+fi
+if grep -q "\[<\] voice from" "$WORK/b.log"; then
+  echo "  ok   B logged the transmission"
+else
+  echo "  FAIL B did not log incoming voice"
   fail=1
 fi
 
